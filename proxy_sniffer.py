@@ -1,221 +1,489 @@
 """
-快速設定步驟（Windows 11 + LDPlayer 9）：
+Pikmin Bloom Proxy Sniffer
+---------------------------
+原理：在電腦上開 mitmproxy，讓模擬器透過它上網。
+遊戲每次載入地圖都會向 Niantic 伺服器查詢附近菇的資料，
+proxy 攔截回應、解析，直接得到座標 + 類型，完全不需要截圖或 OCR。
+
+優點：
+  - 不需要 GPS 一點一點移動
+  - 無截圖/OCR 延遲，幾乎即時
+  - 可在遊戲正常遊玩時背景收集
+
+缺點/注意事項：
+  - 需要 SSL Pinning Bypass（Pikmin Bloom 有憑證釘選）
+  - 步驟比 scanner.py 複雜
+  - 可能違反 Niantic ToS，請自行評估風險
+
+============================================================
+快速設定步驟（Mac + Android Studio AVD）：
 
 1. 安裝 mitmproxy
-   pip install mitmproxy
+   pip install mitmproxy blackboxprotobuf
 
-2. 啟動 proxy（本機 8888 port）
+2. 啟動 AVD（啟用 writable system，用來安裝系統憑證）
+   emulator -avd <AVD名稱> -writable-system
+
+3. 安裝 mitmproxy 系統憑證（只需一次）
+   # 取得憑證 hash
+   openssl x509 -inform PEM -subject_hash_old \\
+     -in ~/.mitmproxy/mitmproxy-ca-cert.pem | head -1
+   # 複製憑證
+   adb root && adb remount
+   adb push ~/.mitmproxy/mitmproxy-ca-cert.pem \\
+     /system/etc/security/cacerts/<hash>.0
+   adb shell chmod 644 /system/etc/security/cacerts/<hash>.0
+   adb reboot
+
+4. 設定模擬器 Wi-Fi Proxy
+   在 AVD 的 Wi-Fi 設定手動填入：
+     主機：10.0.2.2（AVD 內連到宿主機的固定 IP）
+     Port：8888
+
+5. 啟動 proxy
    mitmdump -s proxy_sniffer.py --listen-port 8888
 
    或帶參數：
    mitmdump -s proxy_sniffer.py --listen-port 8888 \\
      --set target_sizes=Large,Giant \\
      --set target_types=Fire,Electric,Water,Crystal,Poisonous \\
-     --set log_path=pikmin_found.log
-
-3. LDPlayer 設定 Proxy
-   LDPlayer 設定 > 其他設定 > 網路橋接（NAT 改為橋接）
-   或在 Android Wi-Fi 設定裡手動填 Proxy：
-     主機：你電腦的區域 IP（ipconfig 查）
-     Port：8888
-
-4. 安裝 mitmproxy 憑證（只需一次）
-   模擬器開瀏覽器前往 http://mitm.it
-   下載並安裝 Android 憑證
-
-5. SSL Pinning Bypass（關鍵步驟）
-   方法 A — Frida（推薦）：
-     pip install frida-tools
-     adb push frida-server /data/local/tmp/
-     adb shell "chmod 755 /data/local/tmp/frida-server"
-     adb shell "/data/local/tmp/frida-server &"
-     frida --codeshare pcipolloni/universal-android-ssl-pinning-bypass-with-frida -U -f jp.pokemon.pikminbloom
-
-   方法 B — Xposed + TrustMeAlready：
-     在 LDPlayer 啟用 Root + Xposed，安裝 TrustMeAlready 模組
+     --set log_path=pikmin_found.log \\
+     --set dump_unknown=true
 
 6. 開遊戲，在地圖上移動，log 自動寫入 pikmin_found.log
+============================================================
 
 安裝：
-  pip install mitmproxy
-Pikmin Bloom mitmproxy Sniffer
--------------------------------
-直接攔截遊戲向 Niantic 伺服器請求的地圖資料，
-無需截圖、OCR、template matching，速度快 10 倍以上。
-
-使用方式：
-  1. 安裝 mitmproxy：
-       pip install mitmproxy
-
-  2. 模擬器 WiFi 代理設為 <你的電腦 IP>:8080
-
-  3. 安裝 mitmproxy CA 憑證到模擬器：
-       mitmproxy 首次啟動後，瀏覽器打開 mitm.it 下載憑證
-       adb push ~/.mitmproxy/mitmproxy-ca-cert.pem /sdcard/
-       adb shell am start -n com.android.certinstaller/.CertInstallerMain \
-           -a android.intent.action.VIEW \
-           -d file:///sdcard/mitmproxy-ca-cert.pem
-
-  4. 啟動 sniffer：
-       mitmdump -s proxy_sniffer.py --ssl-insecure -p 8080
-
-  5. 在模擬器中打開 Pikmin Bloom，移動地圖
-
-  注意：
-  - Niantic 有 SSL pinning，可能需要額外用 Frida 繞過
-  - 違反 Niantic ToS，使用風險自負
-  - 這是教育/研究用途
-
-Frida SSL pinning bypass（需要 root 模擬器）：
-  pip install frida-tools
-  frida -U -f jp.pokemon.pokemongo -l ssl_pinning_bypass.js  # 替換成 Pikmin Bloom 的 package name
+  pip install mitmproxy blackboxprotobuf
 """
 
 import json
 import re
+import math
+import struct
 from datetime import datetime
 from mitmproxy import http
+from mitmproxy import ctx
 
-# 目標菇類型和大小
-TARGET_SIZES = {"Large", "Giant"}
-TARGET_TYPES = {"Fire", "Electric", "Water", "Crystal", "Poisonous"}
+# ---------------------------------------------------------------------------
+# 目標設定（可透過 --set 覆蓋）
+# ---------------------------------------------------------------------------
 
-LOG_FILE = "proxy_found.log"
+TARGET_SIZES = ["Large", "Giant"]
+TARGET_TYPES = ["Fire", "Electric", "Water", "Crystal", "Poisonous"]
+LOG_PATH = "pikmin_found.log"
 
-# Niantic API endpoint 關鍵字（實際路徑需抓包確認）
-NIANTIC_ENDPOINTS = [
-    "pikminbloom",
-    "nianticlabs",
-    "niantic",
+# 去重複：相同 size+type 且距離 < 這個值（公尺）視為同一個菇
+DEDUP_RADIUS_M = 80
+
+SIZES = ["Small", "Normal", "Large", "Giant"]
+ALL_MUSHROOM_TYPES = [
+    "Fire", "Crystal", "Electric", "Water", "Poisonous",
+    "Red", "Yellow", "Blue", "Purple", "White", "Pink", "Gray",
+    "Lavish", "Giant",
 ]
 
-# Size / Type 關鍵字對應（response 裡的 enum 值，需實際抓包後對應）
-# 以下是推測值，需要你實際抓包後更新
-SIZE_MAP = {
-    1: "Small",
-    2: "Normal",
-    3: "Large",
-    4: "Giant",
-}
+# Niantic 相關 hostname
+NIANTIC_HOSTS = [
+    "nianticlabs.com",
+    "niantic.net",
+    "pikmin-bloom.com",
+    "pikminbloom",
+    "ichigo",
+]
 
-TYPE_MAP = {
-    1: "Red",
-    2: "Yellow",
-    3: "Blue",
-    4: "Fire",
-    5: "Water",
-    6: "Electric",
-    7: "Poisonous",
-    8: "Crystal",
-    9: "White",
-    10: "Pink",
-    11: "Purple",
-    12: "Gray",
-}
+# ---------------------------------------------------------------------------
+# mitmproxy options
+# ---------------------------------------------------------------------------
 
-
-def is_niantic_request(url: str) -> bool:
-    return any(kw in url.lower() for kw in NIANTIC_ENDPOINTS)
-
-
-def try_parse_mushroom(body: bytes, url: str):
-    """
-    嘗試從 response body 解析菇資料。
-    body 可能是 JSON 或 protobuf，先試 JSON。
-    """
-    results = []
-
-    # 試 JSON
-    try:
-        data = json.loads(body)
-        results = parse_json_mushrooms(data)
-        if results:
-            return results
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        pass
-
-    # 試 protobuf（需要 betterproto 或 google.protobuf）
-    # 如果你有 proto 定義，在這裡加 protobuf 解析
-    # 暫時只印 hex 供分析用
-    if b"mushroom" in body.lower() or b"Mushroom" in body:
-        print(f"  [Proto?] 可能含菇資料，URL={url}, body hex={body[:80].hex()}")
-
-    return results
+def load_script(loader):
+    loader.add_option(
+        name="target_sizes", typespec=str,
+        default="Large,Giant",
+        help="逗號分隔的目標大小，例如 Large,Giant",
+    )
+    loader.add_option(
+        name="target_types", typespec=str,
+        default="Fire,Electric,Water,Crystal,Poisonous",
+        help="逗號分隔的目標類型",
+    )
+    loader.add_option(
+        name="log_path", typespec=str,
+        default="pikmin_found.log",
+        help="找到目標時寫入的 log 檔路徑",
+    )
+    loader.add_option(
+        name="dump_unknown", typespec=bool,
+        default=False,
+        help="將未解析的 Niantic 回應存成 .bin 供分析",
+    )
 
 
-def parse_json_mushrooms(data) -> list:
-    """
-    遞迴搜尋 JSON 裡含 mushroom 資訊的物件。
-    結構不確定，先做通用搜尋。
-    """
-    results = []
+def configure(updated):
+    global TARGET_SIZES, TARGET_TYPES, LOG_PATH
+    if "target_sizes" in updated:
+        TARGET_SIZES = [s.strip() for s in ctx.options.target_sizes.split(",") if s.strip()]
+    if "target_types" in updated:
+        TARGET_TYPES = [t.strip() for t in ctx.options.target_types.split(",") if t.strip()]
+    if "log_path" in updated:
+        LOG_PATH = ctx.options.log_path
 
-    def search(obj):
-        if isinstance(obj, dict):
-            # 嘗試常見欄位名稱（需實際抓包後調整）
-            keys_lower = {k.lower(): v for k, v in obj.items()}
+# ---------------------------------------------------------------------------
+# 核心 addon
+# ---------------------------------------------------------------------------
 
-            has_mushroom = any(
-                "mushroom" in k or "kinoko" in k
-                for k in keys_lower
-            )
-            if has_mushroom:
-                lat = keys_lower.get("latitude") or keys_lower.get("lat")
-                lon = keys_lower.get("longitude") or keys_lower.get("lon") or keys_lower.get("lng")
-                size_raw = keys_lower.get("size") or keys_lower.get("mushroom_size")
-                type_raw = keys_lower.get("type") or keys_lower.get("mushroom_type") or keys_lower.get("element")
-
-                size = SIZE_MAP.get(size_raw, str(size_raw)) if isinstance(size_raw, int) else str(size_raw)
-                mtype = TYPE_MAP.get(type_raw, str(type_raw)) if isinstance(type_raw, int) else str(type_raw)
-
-                if lat and lon:
-                    results.append({
-                        "lat": lat, "lon": lon,
-                        "size": size, "type": mtype,
-                        "raw": obj,
-                    })
-
-            for v in obj.values():
-                search(v)
-
-        elif isinstance(obj, list):
-            for item in obj:
-                search(item)
-
-    search(data)
-    return results
+def _dist_m(lat1, lon1, lat2, lon2):
+    dlat = (lat2 - lat1) * 111320
+    dlon = (lon2 - lon1) * 111320 * math.cos(math.radians(lat1))
+    return math.sqrt(dlat ** 2 + dlon ** 2)
 
 
-class PikminSniffer:
-    def response(self, flow: http.HTTPFlow):
-        url = flow.request.pretty_url
+def _read_varint(data: bytes, pos: int):
+    result = 0
+    shift = 0
+    while pos < len(data):
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+            break
+    return result, pos
 
-        if not is_niantic_request(url):
+
+def _proto_fields(data: bytes):
+    """極簡 protobuf 掃描，回傳 list of (field_num, wire_type, value_or_bytes)。"""
+    fields = []
+    pos = 0
+    while pos < len(data):
+        try:
+            tag, pos = _read_varint(data, pos)
+        except Exception:
+            break
+        field_num = tag >> 3
+        wire_type = tag & 0x7
+        if field_num == 0 or field_num > 50000:
+            break
+        try:
+            if wire_type == 0:
+                val, pos = _read_varint(data, pos)
+                fields.append((field_num, 0, val))
+            elif wire_type == 2:
+                length, pos = _read_varint(data, pos)
+                if pos + length > len(data) or length > 20_000_000:
+                    break
+                fields.append((field_num, 2, data[pos:pos+length]))
+                pos += length
+            elif wire_type == 1:
+                fields.append((field_num, 1, data[pos:pos+8]))
+                pos += 8
+            elif wire_type == 5:
+                fields.append((field_num, 5, data[pos:pos+4]))
+                pos += 4
+            else:
+                break
+        except Exception:
+            break
+    return fields
+
+
+class MushroomSniffer:
+
+    def __init__(self):
+        # (size, type) -> list of (lat, lon) already logged
+        self._seen: dict[tuple, list] = {}
+        self._bbproto = None  # blackboxprotobuf module（lazy import）
+
+    def _bbp(self):
+        if self._bbproto is None:
+            try:
+                import blackboxprotobuf
+                self._bbproto = blackboxprotobuf
+            except ImportError:
+                self._bbproto = False
+        return self._bbproto if self._bbproto else None
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        host = flow.request.pretty_host
+        if not self._is_niantic(host):
             return
 
-        body = flow.response.content
+        body = flow.response.get_content()
         if not body:
             return
 
-        print(f"\n[API] {flow.request.method} {url[:80]}")
-        print(f"      Status={flow.response.status_code}, Size={len(body)}B")
+        url = flow.request.pretty_url
+        method = flow.request.method
+        ctx.log.debug(f"[Sniffer] {method} {url}  ({len(body)} bytes)")
 
-        mushrooms = try_parse_mushroom(body, url)
+        mushrooms = []
+        is_rpc2 = "rpc2" in url or "rpc" in url.lower()
+
+        # --- 嘗試 JSON 解析 ---
+        try:
+            data = json.loads(body)
+            mushrooms = self._extract_from_json(data)
+            if mushrooms:
+                ctx.log.info(f"[JSON] 從 {url} 找到 {len(mushrooms)} 個候選")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+        # --- rpc2 / protobuf 解析 ---
+        if not mushrooms and is_rpc2:
+            mushrooms = self._extract_from_proto(body, url)
+            if mushrooms:
+                ctx.log.info(f"[Proto] 從 rpc2 找到 {len(mushrooms)} 個候選")
+
+        # --- 文字 regex（含 protobuf 裡的 UTF-8 字串）---
         if not mushrooms:
-            return
+            try:
+                text = body.decode("utf-8", errors="replace")
+                mushrooms = self._extract_from_text(text, url)
+                if mushrooms:
+                    ctx.log.info(f"[Text] 從 {url} 找到 {len(mushrooms)} 個候選")
+            except Exception:
+                pass
+
+        # --- dump rpc2 回應供離線分析 ---
+        do_dump = getattr(ctx.options, "dump_unknown", False)
+        if do_dump or is_rpc2:
+            import os, time
+            dump_dir = "niantic_dumps"
+            os.makedirs(dump_dir, exist_ok=True)
+            safe_host = host.replace(".", "_")
+            tag = "rpc2" if is_rpc2 else "other"
+            fname = f"{dump_dir}/{int(time.time()*1000)}_{safe_host}_{tag}_{len(body)}.bin"
+            with open(fname, "wb") as f:
+                f.write(body)
+            ctx.log.info(f"[Dump] {fname}")
 
         for m in mushrooms:
-            size, mtype = m.get("size"), m.get("type")
-            lat, lon = m.get("lat"), m.get("lon")
+            self._log_match(m, url)
 
-            marker = "***" if (size in TARGET_SIZES and mtype in TARGET_TYPES) else "   "
-            line = f"{marker} [{size} {mtype}] ({lat}, {lon})"
-            print(f"  {line}")
+    # -----------------------------------------------------------------------
 
-            if size in TARGET_SIZES and mtype in TARGET_TYPES:
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with open(LOG_FILE, "a") as f:
-                    f.write(f"{ts}  {line}\n")
+    def _is_niantic(self, host: str) -> bool:
+        return any(h in host for h in NIANTIC_HOSTS)
+
+    # -----------------------------------------------------------------------
+    # JSON 遞迴萃取
+    # -----------------------------------------------------------------------
+
+    def _extract_from_json(self, data, _depth=0):
+        if _depth > 20:
+            return []
+        results = []
+        if isinstance(data, dict):
+            name = (data.get("name") or data.get("displayName") or
+                    data.get("title") or data.get("label") or "")
+            lat  = data.get("latitude") or data.get("lat") or data.get("y")
+            lon  = data.get("longitude") or data.get("lng") or data.get("lon") or data.get("x")
+
+            if name and lat is not None and lon is not None:
+                size, mtype = self._parse_name(str(name))
+                if size and mtype and self._is_target(size, mtype):
+                    results.append({"size": size, "type": mtype,
+                                    "lat": float(lat), "lon": float(lon),
+                                    "raw": str(name)})
+
+            for v in data.values():
+                results.extend(self._extract_from_json(v, _depth + 1))
+
+        elif isinstance(data, list):
+            for item in data:
+                results.extend(self._extract_from_json(item, _depth + 1))
+
+        return results
+
+    # -----------------------------------------------------------------------
+    # Protobuf 萃取（blackboxprotobuf + 手動掃描）
+    # -----------------------------------------------------------------------
+
+    def _extract_from_proto(self, data: bytes, url: str):
+        results = []
+
+        # 方法 1：blackboxprotobuf 深度遞迴搜尋
+        bbp = self._bbp()
+        if bbp:
+            try:
+                msg, _ = bbp.decode_message(data)
+                results = self._search_proto_dict(msg)
+                if results:
+                    return results
+            except Exception:
+                pass
+
+        # 方法 2：手動掃描所有 bytes 欄位，遞迴嘗試解析子 protobuf
+        results = self._scan_proto_recursive(data, depth=0)
+        return results
+
+    def _search_proto_dict(self, obj, _depth=0):
+        """在 blackboxprotobuf 解碼的 dict/list 裡遞迴搜尋菇的資料。"""
+        if _depth > 30:
+            return []
+        results = []
+
+        if isinstance(obj, dict):
+            str_vals = {k: v for k, v in obj.items() if isinstance(v, str)}
+            num_vals = {k: v for k, v in obj.items()
+                        if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+            name = None
+            for k in str_vals:
+                size, mtype = self._parse_name(str_vals[k])
+                if size and mtype:
+                    name = str_vals[k]
+                    break
+
+            lat = lon = None
+            for k, v in num_vals.items():
+                if isinstance(v, float):
+                    if -90 <= v <= 90 and lat is None:
+                        lat = v
+                    elif -180 <= v <= 180 and lon is None:
+                        lon = v
+                elif isinstance(v, int):
+                    fv = v / 1e7
+                    if -90 <= fv <= 90 and lat is None:
+                        lat = fv
+                    elif -180 <= fv <= 180 and lon is None:
+                        lon = fv
+
+            if name:
+                size, mtype = self._parse_name(name)
+                if size and mtype and self._is_target(size, mtype):
+                    results.append({"size": size, "type": mtype,
+                                    "lat": lat, "lon": lon,
+                                    "raw": name})
+
+            for v in obj.values():
+                results.extend(self._search_proto_dict(v, _depth + 1))
+
+        elif isinstance(obj, list):
+            for item in obj:
+                results.extend(self._search_proto_dict(item, _depth + 1))
+
+        return results
+
+    def _scan_proto_recursive(self, data: bytes, depth=0):
+        """手動掃描 protobuf，對每個 bytes 欄位遞迴嘗試解析。"""
+        if depth > 8 or len(data) < 2:
+            return []
+        results = []
+
+        fields = _proto_fields(data)
+        if not fields:
+            return []
+
+        strings = []
+        floats = []
+        for fnum, wtype, val in fields:
+            if wtype == 2 and isinstance(val, bytes):
+                try:
+                    s = val.decode("utf-8")
+                    if s.isprintable():
+                        strings.append((fnum, s))
+                except Exception:
+                    pass
+                sub = self._scan_proto_recursive(val, depth + 1)
+                results.extend(sub)
+                for i in range(0, len(val) - 7, 8):
+                    v = struct.unpack_from("<d", val, i)[0]
+                    if -90 <= v <= 90 and abs(v) > 0.01:
+                        floats.append(("lat_d", i, v))
+                    elif -180 <= v <= 180 and abs(v) > 0.01:
+                        floats.append(("lon_d", i, v))
+            elif wtype in (1, 5):
+                if wtype == 1 and isinstance(val, bytes) and len(val) == 8:
+                    v = struct.unpack_from("<d", val)[0]
+                    if -90 <= v <= 90:
+                        floats.append(("lat_d", fnum, v))
+                    elif -180 <= v <= 180:
+                        floats.append(("lon_d", fnum, v))
+                elif wtype == 5 and isinstance(val, bytes) and len(val) == 4:
+                    v = struct.unpack_from("<f", val)[0]
+                    if -90 <= v <= 90:
+                        floats.append(("lat_f", fnum, v))
+                    elif -180 <= v <= 180:
+                        floats.append(("lon_f", fnum, v))
+
+        for fnum, s in strings:
+            size, mtype = self._parse_name(s)
+            if size and mtype and self._is_target(size, mtype):
+                lat = lon = None
+                for kind, _, v in floats:
+                    if "lat" in kind and lat is None:
+                        lat = v
+                    elif "lon" in kind and lon is None:
+                        lon = v
+                results.append({"size": size, "type": mtype,
+                                "lat": lat, "lon": lon,
+                                "raw": s})
+        return results
+
+    # -----------------------------------------------------------------------
+    # Text regex 萃取
+    # -----------------------------------------------------------------------
+
+    def _extract_from_text(self, text: str, url: str):
+        results = []
+        for size in SIZES:
+            for mtype in ALL_MUSHROOM_TYPES:
+                pattern = rf"\b{re.escape(size)}\s+{re.escape(mtype)}\s+Mushroom\b"
+                for m in re.finditer(pattern, text, re.IGNORECASE):
+                    if not self._is_target(size, mtype):
+                        continue
+                    window = text[max(0, m.start()-300): m.end()+300]
+                    coords = re.findall(r"-?\d{1,3}\.\d{4,10}", window)
+                    lat = lon = None
+                    for c in coords:
+                        val = float(c)
+                        if -90 <= val <= 90 and lat is None:
+                            lat = val
+                        elif -180 <= val <= 180 and lon is None:
+                            lon = val
+                        if lat and lon:
+                            break
+                    results.append({"size": size, "type": mtype,
+                                    "lat": lat, "lon": lon,
+                                    "raw": m.group()})
+        return results
+
+    # -----------------------------------------------------------------------
+
+    def _parse_name(self, name: str):
+        upper = name.upper()
+        size  = next((s for s in SIZES          if s.upper() in upper), None)
+        mtype = next((t for t in ALL_MUSHROOM_TYPES if t.upper() in upper), None)
+        return size, mtype
+
+    def _is_target(self, size: str, mtype: str) -> bool:
+        size_ok  = (size  in TARGET_SIZES) if TARGET_SIZES else True
+        type_ok  = (mtype in TARGET_TYPES) if TARGET_TYPES else True
+        return size_ok and type_ok
+
+    def _is_duplicate(self, m: dict) -> bool:
+        if m.get("lat") is None:
+            return False
+        key = (m["size"], m["type"])
+        for lat, lon in self._seen.get(key, []):
+            if _dist_m(lat, lon, m["lat"], m["lon"]) < DEDUP_RADIUS_M:
+                return True
+        return False
+
+    def _log_match(self, m: dict, url: str):
+        if self._is_duplicate(m):
+            return
+        if m.get("lat") is not None:
+            key = (m["size"], m["type"])
+            self._seen.setdefault(key, []).append((m["lat"], m["lon"]))
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        coord_str = (f"({m['lat']:.6f}, {m['lon']:.6f})"
+                     if m.get("lat") is not None else "(座標未知)")
+        entry = f"{ts}  [{m['size']} {m['type']}]  {coord_str}  raw={m['raw']!r}"
+        ctx.log.warning(f"*** FOUND: {entry}")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
 
 
-addons = [PikminSniffer()]
+addons = [MushroomSniffer()]
