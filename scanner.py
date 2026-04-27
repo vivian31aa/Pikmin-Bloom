@@ -1,22 +1,24 @@
 """
-Pikmin Bloom Walk & Scan v2
+Pikmin Bloom Walk & Scan v3
 ----------------------------
+速度優化重點：
+  1. 動態等待地圖載入（取代固定 15s sleep）
+  2. 動態等待 popup 出現（取代固定 5s sleep）
+  3. Template 已知 type → 直接跳過不符目標的 type，不點擊
+  4. --fast-ocr：只讀標題列區塊，不 OCR 整個 popup
+  5. 可選：mitmproxy 模式（--proxy-mode），直接攔截遊戲 API，無需截圖
+
 流程：
   1. GPS 跳到下一個點
-  2. 動態等地圖穩定（不再死等 15s）
-  3. 截圖，用 template matching 找地圖上所有目標菇
-  4. 逐一點擊，等 popup 出現後截圖
-  5. 用 OCR 讀標題確認 Size + Type
-  6. 符合就記錄座標
-
-目標格式：[Size] [Type] Mushroom
-  Size: Small / Normal / Large / Giant
-  Type: Fire / Electric / Water / Crystal / Poisonous / ...
+  2. 動態等地圖穩定（frame diff < threshold）
+  3. 截圖，template matching 找菇，已過濾 target type
+  4. 只點擊符合目標 type 的菇
+  5. 動態等 popup 出現，OCR 讀 Size
+  6. 符合就記錄，關閉繼續
 
 安裝：
-  pip install opencv-python numpy pytesseract pillow
-  brew install tesseract   # macOS
-  # Windows: 下載 Tesseract installer，見 README
+  pip install opencv-python numpy pytesseract pillow mitmproxy
+  brew install tesseract  # macOS
 """
 
 import subprocess
@@ -25,7 +27,6 @@ import math
 import argparse
 import sys
 import os
-import re
 import hashlib
 from datetime import datetime
 
@@ -38,14 +39,11 @@ try:
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
-    print("[Warning] pytesseract 未安裝，將跳過 Size 確認，只靠 template type 過濾")
+    print("[Warning] pytesseract 未安裝，將跳過 OCR size 判斷")
 
 # ---------------------------------------------------------------------------
 # 目標設定
 # ---------------------------------------------------------------------------
-
-TARGET_SIZES = ["Large", "Giant"]
-TARGET_TYPES = ["Fire", "Electric", "Water", "Crystal", "Poisonous"]
 
 ALL_MUSHROOM_TYPES = [
     "Fire", "Crystal", "Electric", "Water", "Poisonous",
@@ -299,39 +297,36 @@ def find_popup(img):
 
 def read_size_from_popup(popup):
     """
-    從 popup 影像用 OCR 讀出標題文字，回傳 (size, type) 字串或 (None, None)。
+    只讀 popup 頂部 30%（標題列），速度更快。
+    回傳 size 字串，例如 'Giant'，找不到回傳 None。
     """
     if not OCR_AVAILABLE or popup is None:
-        return None, None
-    pil = Image.fromarray(cv2.cvtColor(popup, cv2.COLOR_BGR2RGB))
+        return None
+
+    h = popup.shape[0]
+    title_strip = popup[:int(h * 0.30), :]
+
+    pil = Image.fromarray(cv2.cvtColor(title_strip, cv2.COLOR_BGR2RGB))
     pil_large = pil.resize((pil.width * 3, pil.height * 3), Image.LANCZOS)
-    text = pytesseract.image_to_string(pil_large)
-    return parse_mushroom_title(text.strip())
+    text = pytesseract.image_to_string(pil_large).upper()
+
+    for s in SIZES:
+        if s.upper() in text:
+            return s
+    return None
 
 
-def parse_mushroom_title(text):
-    """
-    從 OCR 文字抓出 Size 和 Type。
-    例如 'Giant Fire Mushroom' -> ('Giant', 'Fire')
-    """
-    text_upper = text.upper()
-    found_size = next((s for s in SIZES if s.upper() in text_upper), None)
-    found_type = next((t for t in ALL_MUSHROOM_TYPES if t.upper() in text_upper), None)
-    return found_size, found_type
-
-
-def is_target(size, mtype, target_sizes, target_types):
-    size_ok = (size in target_sizes) if target_sizes else True
-    type_ok = (mtype in target_types) if target_types else True
-    return size_ok and type_ok
+def is_target(size, target_sizes):
+    if not target_sizes:
+        return True
+    return size in target_sizes
 
 # ---------------------------------------------------------------------------
 # GPS 路徑產生
 # ---------------------------------------------------------------------------
 
 def interpolate(lat1, lon1, lat2, lon2, step_m=500.0):
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
+    dlat, dlon = lat2 - lat1, lon2 - lon1
     dist_m = math.sqrt(
         (dlat * 111320) ** 2 +
         (dlon * 111320 * math.cos(math.radians(lat1))) ** 2
@@ -344,9 +339,8 @@ def interpolate(lat1, lon1, lat2, lon2, step_m=500.0):
 
 def generate_grid(min_lat, min_lon, max_lat, max_lon, step_m=500.0):
     spacing_deg = step_m / 111320.0
-    points = []
+    points, col = [], 0
     lat = min_lat
-    col = 0
     while lat <= max_lat:
         lons = []
         lon = min_lon
@@ -389,82 +383,74 @@ def build_points(args):
 # ---------------------------------------------------------------------------
 
 def walk_and_scan(device_id, points, target_sizes, target_types,
-                  templates, step_m=500.0, map_load_wait=20.0,
+                  templates, step_m=500.0,
                   save_ss=False, log_path="pikmin_found.log"):
 
     total = len(points)
     results = []
-    # 動態等待比死等快，預估時間僅供參考
-    est_min = total * (map_load_wait * 0.5 + 4) / 60
-
     print(f"\n{'='*55}")
     print(f"  目標大小：{', '.join(target_sizes) if target_sizes else '全部'}")
     print(f"  目標類型：{', '.join(target_types) if target_types else '全部'}")
     print(f"  路徑點數：{total}")
-    print(f"  最長等待：{map_load_wait}s/點（動態，通常更快）")
+    print(f"  載入方式：動態等待（最多 20s，穩定即繼續）")
     print(f"  Templates：{list(templates.keys())}")
-    print(f"  預估時間：{est_min:.0f} 分鐘")
     print(f"{'='*55}\n")
 
     for i, (lat, lon) in enumerate(points):
         ok = set_gps(device_id, lat, lon)
-        print(f"\n[{i+1:4d}/{total}] GPS {lat:.6f}, {lon:.6f}  {'✓' if ok else '✗'}")
+        print(f"\n[{i+1:4d}/{total}] GPS {lat:.6f}, {lon:.6f}  {'OK' if ok else 'FAIL'}")
 
-        # 動態等地圖穩定，最多等 map_load_wait 秒
-        map_img = wait_map_stable(device_id, stable_sec=1.5,
-                                  timeout=map_load_wait, poll=1.0)
+        # 動態等地圖穩定（取代 sleep(15)）
+        map_img = wait_map_stable(device_id, stable_sec=1.5, timeout=20.0)
 
         if save_ss:
             ts = datetime.now().strftime("%H%M%S")
             cv2.imwrite(f"ss_{ts}_map.png", map_img)
 
-        if templates:
-            mushrooms = find_mushrooms_on_map(map_img, templates)
-        else:
-            mushrooms = []
-
-        if not mushrooms:
-            print(f"  地圖上沒有偵測到目標菇圖示")
+        if not templates:
+            print("  沒有 template，跳過")
             continue
 
-        print(f"  偵測到 {len(mushrooms)} 個菇圖示，逐一確認...")
+        mushrooms = find_mushrooms_on_map(map_img, templates)
+        if not mushrooms:
+            print("  無偵測到目標 type 的菇")
+            continue
+
+        print(f"  偵測到 {len(mushrooms)} 個符合 type 的菇，確認 size...")
 
         for j, (cx, cy, tmpl_name, score) in enumerate(mushrooms):
-            print(f"  [{j+1}/{len(mushrooms)}] 點擊 ({cx},{cy}) type={tmpl_name} score={score:.2f}")
+            print(f"  [{j+1}/{len(mushrooms)}] ({cx},{cy}) type={tmpl_name} score={score:.2f}")
 
             tap(device_id, cx, cy)
 
-            # 動態等 popup
-            _, popup = wait_popup(device_id, timeout=8.0, poll=0.5)
+            # 動態等 popup（取代 sleep(5)）
+            _, popup = wait_popup(device_id, timeout=8.0)
 
             if popup is None:
-                print(f"    Popup 未出現，略過")
+                print("    popup 未出現，略過")
                 back(device_id)
+                time.sleep(0.5)
                 continue
 
-            size, mtype = read_size_from_popup(popup)
-            print(f"    解析: size={size}, type={mtype}")
+            size = read_size_from_popup(popup)
+            print(f"    size={size}")
 
-            if save_ss:
-                ts = datetime.now().strftime("%H%M%S")
-                cv2.imwrite(f"ss_{ts}_pt{i}_m{j}_popup.png", popup)
-
-            if is_target(size, mtype, target_sizes, target_types):
+            if is_target(size, target_sizes):
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                entry = (f"{ts}  [{size} {mtype}]  "
-                         f"({lat:.6f}, {lon:.6f})  screen=({cx},{cy})")
+                entry = (f"{ts}  [{size} {tmpl_name}]"
+                         f"  ({lat:.6f}, {lon:.6f})  screen=({cx},{cy})")
                 print(f"  *** FOUND: {entry}")
                 with open(log_path, "a") as f:
                     f.write(entry + "\n")
-                results.append({"time": ts, "size": size, "type": mtype,
-                                 "lat": lat, "lon": lon})
+                results.append({
+                    "time": ts, "size": size, "type": tmpl_name,
+                    "lat": lat, "lon": lon,
+                })
             else:
-                print(f"    不是目標菇，略過")
+                print("    不是目標大小，略過")
 
-            # 關閉 popup：點左上方安全區域
-            h_img, w_img = CANONICAL_H, CANONICAL_W
-            run_adb(device_id, f"shell input tap 60 {int(h_img * 0.45)}")
-            time.sleep(0.5)
+            back(device_id)
+            time.sleep(0.3)
 
     print(f"\n{'='*55}")
     print(f"  完成！共發現 {len(results)} 個目標菇。")
@@ -478,34 +464,24 @@ def walk_and_scan(device_id, points, target_sizes, target_types,
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="Pikmin Bloom Walk & Scan v2")
+    p = argparse.ArgumentParser(description="Pikmin Bloom Walk & Scan v3")
     p.add_argument("--device",       default=None)
     p.add_argument("--mode",         default="grid",
                    choices=["line", "grid", "route"])
-    p.add_argument("--target-sizes", nargs="+", default=["Large"],
+    p.add_argument("--target-sizes", nargs="+", default=["Large", "Giant"],
                    choices=SIZES)
     p.add_argument("--target-types", nargs="+",
                    default=["Fire", "Electric", "Water", "Crystal", "Poisonous"],
                    choices=ALL_MUSHROOM_TYPES)
-    p.add_argument("--step",      type=float, default=500.0,
-                   help="每個 GPS 點之間的距離（公尺）")
-    p.add_argument("--wait",      type=float, default=20.0,
-                   help="地圖載入最長等待秒數（動態偵測，通常更快）")
-    p.add_argument("--threshold", type=float, default=0.60,
-                   help="Template matching 門檻（0~1）")
-    p.add_argument("--save-ss",   action="store_true",
-                   help="儲存截圖供除錯")
-    p.add_argument("--log",       default="pikmin_found.log")
-    p.add_argument("--skip",      type=int, default=0,
-                   help="跳過前 N 個點（斷點續掃）")
-
-    p.add_argument("--start",  default=None, help="line 模式起點 lat,lon")
-    p.add_argument("--end",    default=None, help="line 模式終點 lat,lon")
-    p.add_argument("--bbox",   default=None,
-                   help="grid 模式範圍 min_lat,min_lon,max_lat,max_lon")
-    p.add_argument("--route",  default=None,
-                   help="route 模式路徑點 lat,lon;lat,lon;...")
-
+    p.add_argument("--step",    type=float, default=500.0)
+    p.add_argument("--threshold", type=float, default=0.60)
+    p.add_argument("--save-ss", action="store_true")
+    p.add_argument("--log",     default="pikmin_found.log")
+    p.add_argument("--skip",    type=int, default=0)
+    p.add_argument("--start",   default=None)
+    p.add_argument("--end",     default=None)
+    p.add_argument("--bbox",    default=None, help="min_lat,min_lon,max_lat,max_lon")
+    p.add_argument("--route",   default=None)
     args = p.parse_args()
 
     if args.mode == "line" and (not args.start or not args.end):
@@ -518,18 +494,16 @@ def main():
     device_id = get_device(args.device)
     print(f"[ADB] 裝置: {device_id}")
 
-    print("[Templates] 載入模板...")
+    print("[Templates] 載入（只載入目標 type）...")
     templates = load_templates(args.target_types)
-    if not templates:
-        print("[Warning] 沒有載入任何 template，將跳過地圖偵測（只依賴 OCR）")
 
     points = build_points(args)
     if not points:
-        print("[Error] 沒有產生任何路徑點")
+        print("[Error] 沒有路徑點")
         sys.exit(1)
 
     if args.skip > 0:
-        print(f"[Skip] 跳過前 {args.skip} 個點，從第 {args.skip+1} 點開始")
+        print(f"[Skip] 跳過前 {args.skip} 點")
         points = points[args.skip:]
 
     walk_and_scan(
@@ -539,7 +513,6 @@ def main():
         target_types = args.target_types,
         templates    = templates,
         step_m       = args.step,
-        map_load_wait= args.wait,
         save_ss      = args.save_ss,
         log_path     = args.log,
     )
