@@ -71,7 +71,7 @@ def load_templates(target_types=None):
             continue
         name = fname.replace(".png", "").lower()
         if want and name not in want:
-            continue  # 跳過不是目標 type 的 template
+            continue
         img = cv2.imread(os.path.join(TEMPLATE_DIR, fname))
         if img is not None:
             templates[name] = img
@@ -134,20 +134,19 @@ def back(device_id):
 
 
 def _frame_hash(img):
-    # 取地圖中央區塊計算 hash，忽略動態 UI
     h, w = img.shape[:2]
     roi = img[int(h*0.15):int(h*0.80), int(w*0.1):int(w*0.9)]
     small = cv2.resize(roi, (64, 64))
     return hashlib.md5(small.tobytes()).hexdigest()
 
 # ---------------------------------------------------------------------------
-# 動態等待：取代 time.sleep(N)
+# 動態等待：取代固定 time.sleep(N)
 # ---------------------------------------------------------------------------
 
 def wait_map_stable(device_id, stable_sec=1.5, timeout=20.0, poll=1.0):
     """
-    輪詢截圖，連續 stable_sec 內畫面不變就認定載入完成。
-    最多等 timeout 秒，比死等 15s 平均快 2–3 倍。
+    輪詢截圖直到畫面連續 stable_sec 無變化，表示地圖已載入完成。
+    比死等 15s 平均快 2–3 倍。
     """
     deadline = time.time() + timeout
     prev_hash = None
@@ -169,19 +168,18 @@ def wait_map_stable(device_id, stable_sec=1.5, timeout=20.0, poll=1.0):
         h = _frame_hash(img)
         if h == prev_hash:
             if stable_since and (time.time() - stable_since) >= stable_sec:
-                return img  # 地圖穩定，回傳最新截圖
+                return img
         else:
             stable_since = time.time()
         prev_hash = h
         time.sleep(poll)
 
-    return screencap(device_id)  # timeout → 直接截圖
+    return screencap(device_id)
 
 
 def wait_popup(device_id, timeout=8.0, poll=0.5):
     """
-    輪詢等待 popup 出現（取代 sleep(5)）。
-    找到就立刻回傳，平均省 2–4 秒。
+    輪詢等待 popup 出現，找到立刻回傳，比 sleep(5) 平均省 2–4 秒。
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -193,7 +191,8 @@ def wait_popup(device_id, timeout=8.0, poll=0.5):
         except Exception:
             pass
         time.sleep(poll)
-    return screencap(device_id), None
+    img = screencap(device_id)
+    return img, None
 
 # ---------------------------------------------------------------------------
 # Network Error 偵測
@@ -219,7 +218,7 @@ def check_and_dismiss_network_error_img(device_id, img):
     return False
 
 # ---------------------------------------------------------------------------
-# Template Matching
+# Template Matching：找地圖上的菇
 # ---------------------------------------------------------------------------
 
 def find_mushrooms_on_map(img, templates, threshold=0.60):
@@ -274,7 +273,7 @@ def find_mushrooms_on_map(img, templates, threshold=0.60):
     return found
 
 # ---------------------------------------------------------------------------
-# OCR：只讀標題列
+# OCR：讀 popup 標題
 # ---------------------------------------------------------------------------
 
 def find_popup(img):

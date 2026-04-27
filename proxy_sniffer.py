@@ -1,4 +1,43 @@
 """
+快速設定步驟（Windows 11 + LDPlayer 9）：
+
+1. 安裝 mitmproxy
+   pip install mitmproxy
+
+2. 啟動 proxy（本機 8888 port）
+   mitmdump -s proxy_sniffer.py --listen-port 8888
+
+   或帶參數：
+   mitmdump -s proxy_sniffer.py --listen-port 8888 \\
+     --set target_sizes=Large,Giant \\
+     --set target_types=Fire,Electric,Water,Crystal,Poisonous \\
+     --set log_path=pikmin_found.log
+
+3. LDPlayer 設定 Proxy
+   LDPlayer 設定 > 其他設定 > 網路橋接（NAT 改為橋接）
+   或在 Android Wi-Fi 設定裡手動填 Proxy：
+     主機：你電腦的區域 IP（ipconfig 查）
+     Port：8888
+
+4. 安裝 mitmproxy 憑證（只需一次）
+   模擬器開瀏覽器前往 http://mitm.it
+   下載並安裝 Android 憑證
+
+5. SSL Pinning Bypass（關鍵步驟）
+   方法 A — Frida（推薦）：
+     pip install frida-tools
+     adb push frida-server /data/local/tmp/
+     adb shell "chmod 755 /data/local/tmp/frida-server"
+     adb shell "/data/local/tmp/frida-server &"
+     frida --codeshare pcipolloni/universal-android-ssl-pinning-bypass-with-frida -U -f jp.pokemon.pikminbloom
+
+   方法 B — Xposed + TrustMeAlready：
+     在 LDPlayer 啟用 Root + Xposed，安裝 TrustMeAlready 模組
+
+6. 開遊戲，在地圖上移動，log 自動寫入 pikmin_found.log
+
+安裝：
+  pip install mitmproxy
 Pikmin Bloom mitmproxy Sniffer
 -------------------------------
 直接攔截遊戲向 Niantic 伺服器請求的地圖資料，
