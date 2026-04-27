@@ -155,6 +155,14 @@ class MushroomSniffer:
         url = flow.request.pretty_url
         ctx.log.debug(f"[Sniffer] {flow.request.method} {url}  ({len(body)} bytes)")
 
+        # 把所有 Niantic response 存成 .bin 供分析
+        import os, time
+        dump_dir = "niantic_dumps"
+        os.makedirs(dump_dir, exist_ok=True)
+        fname = f"{dump_dir}/{int(time.time()*1000)}_{host}_{len(body)}.bin"
+        with open(fname, "wb") as f:
+            f.write(body)
+
         mushrooms = []
 
         # --- 嘗試 JSON 解析 ---
