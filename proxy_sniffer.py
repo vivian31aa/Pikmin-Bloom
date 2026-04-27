@@ -60,8 +60,7 @@ proxy 攔截回應、解析，直接得到座標 + 類型，完全不需要截�
 
 import json
 import re
-import os
-import struct
+import math
 from datetime import datetime
 from mitmproxy import http
 from mitmproxy import ctx
@@ -73,6 +72,9 @@ from mitmproxy import ctx
 TARGET_SIZES = ["Large", "Giant"]
 TARGET_TYPES = ["Fire", "Electric", "Water", "Crystal", "Poisonous"]
 LOG_PATH = "pikmin_found.log"
+
+# 去重複：相同 size+type 且距離 < 這個值（公尺）視為同一個菇
+DEDUP_RADIUS_M = 80
 
 SIZES = ["Small", "Normal", "Large", "Giant"]
 ALL_MUSHROOM_TYPES = [
@@ -87,7 +89,6 @@ NIANTIC_HOSTS = [
     "niantic.net",
     "pikmin-bloom.com",
     "pikminbloom",
-    "1.1.1.1",  # 備用：有些版本用直接 IP
 ]
 
 # ---------------------------------------------------------------------------
@@ -130,7 +131,17 @@ def configure(updated):
 # 核心 addon
 # ---------------------------------------------------------------------------
 
+def _dist_m(lat1, lon1, lat2, lon2):
+    dlat = (lat2 - lat1) * 111320
+    dlon = (lon2 - lon1) * 111320 * math.cos(math.radians(lat1))
+    return math.sqrt(dlat ** 2 + dlon ** 2)
+
+
 class MushroomSniffer:
+
+    def __init__(self):
+        # (size, type) -> list of (lat, lon) already logged
+        self._seen: dict[tuple, list] = {}
 
     def response(self, flow: http.HTTPFlow) -> None:
         host = flow.request.pretty_host
@@ -239,12 +250,27 @@ class MushroomSniffer:
         type_ok  = (mtype in TARGET_TYPES) if TARGET_TYPES else True
         return size_ok and type_ok
 
+    def _is_duplicate(self, m: dict) -> bool:
+        if m.get("lat") is None:
+            return False
+        key = (m["size"], m["type"])
+        for lat, lon in self._seen.get(key, []):
+            if _dist_m(lat, lon, m["lat"], m["lon"]) < DEDUP_RADIUS_M:
+                return True
+        return False
+
     def _log_match(self, m: dict, url: str):
+        if self._is_duplicate(m):
+            return
+        if m.get("lat") is not None:
+            key = (m["size"], m["type"])
+            self._seen.setdefault(key, []).append((m["lat"], m["lon"]))
+
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         coord_str = (f"({m['lat']:.6f}, {m['lon']:.6f})"
                      if m.get("lat") is not None else "(座標未知)")
         entry = f"{ts}  [{m['size']} {m['type']}]  {coord_str}  raw={m['raw']!r}"
-        ctx.log.warn(f"*** FOUND: {entry}")
+        ctx.log.warning(f"*** FOUND: {entry}")
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
 
