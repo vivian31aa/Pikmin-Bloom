@@ -11,14 +11,26 @@ let dumpIndex = 0;
 
 // malloc/free tracker — armed after large SSL_read to catch decrypted buffer
 let trackMalloc = false;
+let trackSmall  = false;  // arm to catch small buffers (1000-50000 bytes)
 const capturedAddrs = new Set();  // deduplicate: only dump each addr once per session
 const largeAllocs = new Map();  // ptr_str → size
+const smallAllocs = new Map();  // ptr_str → size (1000-50000 byte range)
 
 function hexOf(arr, n) {
     n = Math.min(n || 32, arr.length);
     let s = "";
     for (let i = 0; i < n; i++) s += ("0" + (arr[i] & 0xff).toString(16)).slice(-2) + " ";
     return s.trimEnd();
+}
+
+// sendBufRaw: no min-size gate — for small mushroom record buffers
+function sendBufRaw(label, alg, bytes) {
+    if (!bytes || bytes.length === 0) return;
+    const idx = dumpIndex++;
+    console.log("\n[CAPTURED] " + label + "  len=" + bytes.length);
+    console.log("  preview: " + hexOf(bytes, 32));
+    send({ type:"buffer", index:idx, label:label, alg:alg, len:bytes.length },
+         bytes.buffer || bytes);
 }
 
 function sendBuf(label, alg, bytes) {
@@ -81,11 +93,15 @@ let rpc2LargeDetected = false;  // flag to trigger auto memory scan
                 if (full.length > 40000 && !rpc2LargeDetected) {
                     rpc2LargeDetected = true;
                     trackMalloc = true;
-                    console.log("[SSL_read] large rpc2 chunk (" + full.length + " bytes) — arming malloc tracker, scan_coords in 5s");
+                    trackSmall  = true;
+                    console.log("[SSL_read] large rpc2 chunk (" + full.length + " bytes) — arming malloc+small tracker, scan_coords in 5s");
                     setTimeout(function() {
                         trackMalloc = false;
-                        console.log("[auto-scan] running scan_coords...");
+                        trackSmall  = false;
+                        console.log("[auto-scan] running scan_coords + scan_int7 + scan_mushroom_records...");
                         scan_coords();
+                        scan_int7();
+                        scan_mushroom_records();
                         rpc2LargeDetected = false;
                     }, 5000);
                 }
@@ -399,43 +415,183 @@ global.scan_coords = function() {
     Interceptor.attach(mallocFn, {
         onEnter(a) { this.sz = a[0].toUInt32(); },
         onLeave(ret) {
-            if (!trackMalloc || this.sz < 50000 || this.sz > 1000000 || ret.isNull()) return;
-            largeAllocs.set(ret.toString(), this.sz);
+            if (ret.isNull()) return;
+            if (trackMalloc && this.sz >= 50000 && this.sz <= 1000000)
+                largeAllocs.set(ret.toString(), this.sz);
+            else if (trackSmall && this.sz >= 1000 && this.sz < 50000)
+                smallAllocs.set(ret.toString(), this.sz);
         }
     });
 
     Interceptor.attach(freeFn, {
         onEnter(args) {
             const key = args[0].toString();
-            const sz  = largeAllocs.get(key);
-            if (!sz) return;
-            largeAllocs.delete(key);
-            if (capturedAddrs.has(key)) return;  // skip already-dumped address
-            try {
-                const sample = new Uint8Array(args[0].readByteArray(Math.min(sz, 512)));
-                const freq = new Array(256).fill(0);
-                for (const b of sample) freq[b]++;
-                let h = 0;
-                for (const c of freq) if (c > 0) { const p = c/sample.length; h -= p * Math.log2(p); }
-                const u32 = sample[0]|(sample[1]<<8)|(sample[2]<<16)|(sample[3]<<24);
-                console.log("[pre-free] sz=" + sz + " H=" + h.toFixed(2) + " u32=" + u32 + " @ " + key);
-                if (h < 7.5) {
-                    capturedAddrs.add(key);
-                    sendBuf("pre_free@" + key, "H" + h.toFixed(1), new Uint8Array(args[0].readByteArray(sz)));
+
+            // ── large buffer (50KB-1MB): dump if low entropy ──
+            const sz = largeAllocs.get(key);
+            if (sz) {
+                largeAllocs.delete(key);
+                if (!capturedAddrs.has(key)) {
+                    try {
+                        const sample = new Uint8Array(args[0].readByteArray(Math.min(sz, 512)));
+                        const freq = new Array(256).fill(0);
+                        for (const b of sample) freq[b]++;
+                        let h = 0;
+                        for (const c of freq) if (c > 0) { const p = c/sample.length; h -= p * Math.log2(p); }
+                        const u32 = sample[0]|(sample[1]<<8)|(sample[2]<<16)|(sample[3]<<24);
+                        console.log("[pre-free] sz=" + sz + " H=" + h.toFixed(2) + " u32=" + u32 + " @ " + key);
+                        if (h < 7.5) {
+                            capturedAddrs.add(key);
+                            sendBuf("pre_free@" + key, "H" + h.toFixed(1), new Uint8Array(args[0].readByteArray(sz)));
+                        }
+                    } catch(_) {}
                 }
+                return;
+            }
+
+            // ── small buffer (1KB-50KB): dump if it contains int7 coord pair ──
+            const smallSz = smallAllocs.get(key);
+            if (!smallSz) return;
+            smallAllocs.delete(key);
+            if (capturedAddrs.has(key)) return;
+            try {
+                const bytes = new Uint8Array(args[0].readByteArray(smallSz));
+                const dv = new DataView(bytes.buffer);
+                let hasCoord = false, hasSmall = false;
+                outer: for (let i = 0; i <= bytes.length - 8; i += 4) {
+                    const v = dv.getInt32(i, true);
+                    if (v < 200_000_000 || v > 270_000_000) continue;
+                    for (const delta of [4, 8, -4, -8]) {
+                        const j = i + delta;
+                        if (j < 0 || j + 4 > bytes.length) continue;
+                        const w = dv.getInt32(j, true);
+                        if (w >= 1_180_000_000 && w <= 1_255_000_000) { hasCoord = true; break outer; }
+                    }
+                }
+                if (!hasCoord) return;
+                for (let i = 0; i <= bytes.length - 4; i += 4) {
+                    const v = dv.getInt32(i, true);
+                    if (v >= 1 && v <= 200) { hasSmall = true; break; }
+                }
+                capturedAddrs.add(key);
+                const label = (hasSmall ? "mushroom_record" : "coord_buf") + "@" + key;
+                console.log("[small-free] " + label + " sz=" + smallSz + " hasType=" + hasSmall);
+                sendBufRaw(label, "small", bytes);
             } catch(_) {}
         }
     });
     console.log("[+] malloc/free hooked (tracking when armed)");
 })();
 
+// ── 10. scan_int7: scan all readable memory for int32×1e7 Taiwan coord pairs ────
+global.scan_int7 = function(cap) {
+    cap = cap || 60;
+    console.log("[*] scan_int7: lat∈[200M,270M] lon∈[1180M,1255M] int32 pairs...");
+    let found = 0;
+    const ranges = [];
+    ["r--", "rw-"].forEach(p => { try { Process.enumerateRanges(p).forEach(r => ranges.push(r)); } catch(_) {} });
+
+    for (const r of ranges) {
+        if (r.size < 8 || r.size > 200*1024*1024) continue;
+        let data;
+        try { data = r.base.readByteArray(r.size); } catch(_) { continue; }
+        const dv = new DataView(data);
+        const n = data.byteLength;
+
+        for (let i = 0; i <= n - 8; i += 4) {
+            let v;
+            try { v = dv.getInt32(i, true); } catch(_) { continue; }
+            if (v < 200_000_000 || v > 270_000_000) continue;
+            for (const delta of [4, 8, -4, -8]) {
+                const j = i + delta;
+                if (j < 0 || j + 4 > n) continue;
+                let w;
+                try { w = dv.getInt32(j, true); } catch(_) { continue; }
+                if (w >= 1_180_000_000 && w <= 1_255_000_000) {
+                    const lat = v / 1e7, lon = w / 1e7;
+                    console.log("  INT7 @ " + r.base.add(i) + " (" + r.protection + ")" +
+                                " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6) + " Δ=" + delta);
+                    const ctxOff = Math.max(0, i - 24);
+                    const ctxLen = Math.min(80, n - ctxOff);
+                    console.log("    ctx: " + hexOf(new Uint8Array(data, ctxOff, ctxLen), 48));
+                    found++;
+                    if (found >= cap) { console.log("  (capped at " + cap + ")"); return; }
+                    break;
+                }
+            }
+        }
+    }
+    console.log("[*] scan_int7 done: " + found + " pairs found");
+};
+
+// ── 11. scan_mushroom_records: int7 lat+lon AND small int (type/size) in same 64B ─
+global.scan_mushroom_records = function(cap) {
+    cap = cap || 100;
+    console.log("[*] scan_mushroom_records: int7 coord + nearby small int (1-200)...");
+    let found = 0;
+    const ranges = [];
+    ["r--", "rw-"].forEach(p => { try { Process.enumerateRanges(p).forEach(r => ranges.push(r)); } catch(_) {} });
+
+    for (const r of ranges) {
+        if (r.size < 16 || r.size > 200*1024*1024) continue;
+        let data;
+        try { data = r.base.readByteArray(r.size); } catch(_) { continue; }
+        const dv = new DataView(data);
+        const n = data.byteLength;
+
+        for (let i = 0; i <= n - 8; i += 4) {
+            let v;
+            try { v = dv.getInt32(i, true); } catch(_) { continue; }
+            if (v < 200_000_000 || v > 270_000_000) continue;
+
+            let lonOff = -1;
+            for (const delta of [4, 8, -4, -8, 12, -12, 16, -16]) {
+                const j = i + delta;
+                if (j < 0 || j + 4 > n) continue;
+                let w;
+                try { w = dv.getInt32(j, true); } catch(_) { continue; }
+                if (w >= 1_180_000_000 && w <= 1_255_000_000) { lonOff = j; break; }
+            }
+            if (lonOff < 0) continue;
+
+            const lat = v / 1e7;
+            const lon = dv.getInt32(lonOff, true) / 1e7;
+            const searchStart = Math.max(0, Math.min(i, lonOff) - 32);
+            const searchEnd   = Math.min(n - 4, Math.max(i, lonOff) + 36);
+            const smallInts   = [];
+            for (let k = searchStart; k <= searchEnd; k += 4) {
+                if ((k >= i && k < i + 4) || (k >= lonOff && k < lonOff + 4)) continue;
+                let sv;
+                try { sv = dv.getInt32(k, true); } catch(_) { continue; }
+                if (sv >= 1 && sv <= 200) smallInts.push({ rel: k - i, val: sv });
+            }
+            if (smallInts.length === 0) continue;
+
+            console.log("  MUSHROOM @ " + r.base.add(i) + " (" + r.protection + ")" +
+                        " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6));
+            for (const si of smallInts)
+                console.log("    small[" + (si.rel >= 0 ? "+" : "") + si.rel + "] = " + si.val);
+            const ctxOff = Math.max(0, Math.min(i, lonOff) - 32);
+            const ctxLen = Math.min(96, n - ctxOff);
+            console.log("    ctx: " + hexOf(new Uint8Array(data, ctxOff, ctxLen), 64));
+
+            found++;
+            if (found >= cap) { console.log("  (capped at " + cap + ")"); return; }
+        }
+    }
+    console.log("[*] scan_mushroom_records done: " + found + " candidates");
+};
+
 // Expose functions to Python via rpc.exports
 rpc.exports = {
-    scanFb:          function() { scan_fb(); },
-    scanPlaintext:   function(minSize) { scan_plaintext(minSize); },
-    scanCoords:      function() { scan_coords(); },
-    evalJs:          function(code) { return eval(code); },
+    scanFb:              function() { scan_fb(); },
+    scanPlaintext:       function(minSize) { scan_plaintext(minSize); },
+    scanCoords:          function() { scan_coords(); },
+    scanInt7:            function() { scan_int7(); },
+    scanMushroomRecords: function() { scan_mushroom_records(); },
+    evalJs:              function(code) { return eval(code); },
 };
 
 console.log("[*] All hooks loaded. Waiting for rpc2...");
-console.log("[*] REPL: scan_coords() | scan_fb() | scan_plaintext() | eval(<js>)");
+console.log("[*] REPL: scan_coords() | scan_int7() | scan_mushroom_records() | scan_fb() | scan_plaintext() | eval(<js>)");
+console.log("[*] Flags: trackMalloc (50KB-1MB large bufs) | trackSmall (1KB-50KB coord bufs)");
