@@ -36,13 +36,39 @@ PIKMIN_PACKAGES = [
 ]
 
 
+DUMP_DIR = os.path.join(os.path.dirname(__file__), "decrypted_dumps")
+os.makedirs(DUMP_DIR, exist_ok=True)
+
+
 def on_message(message, data):
-    if message["type"] == "send":
-        print(f"[hook] {message['payload']}")
-    elif message["type"] == "error":
+    if message["type"] == "error":
         print(f"[error] {message['stack']}")
+        return
+
+    if message["type"] != "send":
+        return
+
+    payload = message.get("payload", {})
+
+    # Binary buffer sent from hook
+    if isinstance(payload, dict) and payload.get("type") == "buffer" and data:
+        idx   = payload.get("index", 0)
+        label = payload.get("label", "buf")
+        alg   = payload.get("alg", "?")
+        size  = len(data)
+        fname = f"{idx:03d}_{label.replace('/', '_')}_{size}.bin"
+        fpath = os.path.join(DUMP_DIR, fname)
+        with open(fpath, "wb") as f:
+            f.write(data)
+        print(f"\n[+] Saved {size:,} bytes → {fpath}")
+        print(f"    alg={alg}  preview={data[:24].hex()}")
+        # Quick FlatBuffers check
+        if len(data) >= 4:
+            u32 = int.from_bytes(data[:4], "little")
+            if 0 < u32 < 500:
+                print(f"    ** FlatBuffers root_off={u32} — run: python decode_rpc2.py \"{fpath}\"")
     else:
-        print(f"[msg] {message}")
+        print(f"[hook] {payload}")
 
 
 def find_pikmin_process(device):
