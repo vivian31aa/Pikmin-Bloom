@@ -110,18 +110,25 @@ Java.perform(function() {
             return out;
         }
 
-        Cipher.doFinal.overload("[B").implementation = function(input) {
-            const result = this.doFinal(input);
-            if (this.getOpmode() === DECRYPT_MODE && result && result.length >= MIN_DUMP_SIZE) {
-                sendBuf("Java.Cipher", this.getAlgorithm(), fromJava(result));
+        // Save original overloads and call them to avoid recursion issues
+        const orig1 = Cipher.doFinal.overload("[B");
+        const orig3 = Cipher.doFinal.overload("[B", "int", "int");
+
+        orig1.implementation = function(input) {
+            const result = orig1.call(this, input);
+            // Capture all large outputs regardless of mode (decode_rpc2.py will check entropy)
+            if (result && result.length >= MIN_DUMP_SIZE) {
+                const alg = this.getAlgorithm ? this.getAlgorithm() : "?";
+                sendBuf("Java.Cipher", alg, fromJava(result));
             }
             return result;
         };
 
-        Cipher.doFinal.overload("[B", "int", "int").implementation = function(input, off, len) {
-            const result = this.doFinal(input, off, len);
-            if (this.getOpmode() === DECRYPT_MODE && result && result.length >= MIN_DUMP_SIZE) {
-                sendBuf("Java.Cipher/3", this.getAlgorithm(), fromJava(result));
+        orig3.implementation = function(input, off, len) {
+            const result = orig3.call(this, input, off, len);
+            if (result && result.length >= MIN_DUMP_SIZE) {
+                const alg = this.getAlgorithm ? this.getAlgorithm() : "?";
+                sendBuf("Java.Cipher/3", alg, fromJava(result));
             }
             return result;
         };
