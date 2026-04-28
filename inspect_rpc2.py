@@ -10,62 +10,88 @@ with open(path, "rb") as f:
     data = f.read()
 
 print(f"Size: {len(data)} bytes")
-print(f"First 16 bytes: {data[:16].hex()}")
 print()
 
-# 掃描所有可能是 Taiwan lat/lon 的 double（步距 1 byte 避免遺漏）
-LAT_MIN, LAT_MAX = 20.0, 27.0     # Taiwan lat
-LON_MIN, LON_MAX = 118.0, 124.0   # Taiwan lon
-
-lat_offsets = []
-lon_offsets = []
-
+# -----------------------------------------------------------------------
+# 1. 搜尋 double lat (20-27) 和 double lon (118-125)
+# -----------------------------------------------------------------------
+lat_d, lon_d = [], []
 for i in range(0, len(data) - 7):
     v = struct.unpack_from("<d", data, i)[0]
-    if LAT_MIN <= v <= LAT_MAX:
-        lat_offsets.append((i, v))
-    elif LON_MIN <= v <= LON_MAX:
-        lon_offsets.append((i, v))
+    if 20.0 <= v <= 27.0:
+        lat_d.append((i, v))
+    elif 118.0 <= v <= 125.0:
+        lon_d.append((i, v))
 
-print(f"Taiwan lat candidates: {len(lat_offsets)}")
-print(f"Taiwan lon candidates: {len(lon_offsets)}")
-print()
+print(f"Double lat(20-27): {len(lat_d)}  Double lon(118-125): {len(lon_d)}")
 
-# 配對：找 lat 附近 ±32 bytes 內有沒有 lon
-print("=== Coordinate Pairs ===")
-pairs = []
-for lat_off, lat_val in lat_offsets:
-    for lon_off, lon_val in lon_offsets:
-        dist = abs(lon_off - lat_off)
-        if dist <= 32:
-            pairs.append((lat_off, lon_off, lat_val, lon_val, dist))
+# -----------------------------------------------------------------------
+# 2. 搜尋 int32 scaled by 1e7
+#    Taiwan lat  *1e7 = 200_000_000 ~ 270_000_000
+#    Taiwan lon  *1e7 = 1_180_000_000 ~ 1_250_000_000
+# -----------------------------------------------------------------------
+lat_i, lon_i = [], []
+for i in range(0, len(data) - 3):
+    v = struct.unpack_from("<i", data, i)[0]
+    if 200_000_000 <= v <= 270_000_000:
+        lat_i.append((i, v / 1e7))
+    elif 1_180_000_000 <= v <= 1_250_000_000:
+        lon_i.append((i, v / 1e7))
 
-pairs.sort(key=lambda x: x[0])
-for lat_off, lon_off, lat_val, lon_val, dist in pairs:
-    print(f"  lat={lat_val:.6f}  lon={lon_val:.6f}  "
-          f"(lat_off={lat_off}, lon_off={lon_off}, dist={dist})")
-    # 顯示周圍 32 bytes（找類型 enum）
-    ctx_start = max(0, min(lat_off, lon_off) - 16)
-    ctx_end = min(len(data), max(lat_off, lon_off) + 24)
-    ctx = data[ctx_start:ctx_end]
-    print(f"    context hex: {ctx.hex()}")
-    # 解析 context 裡的小整數（可能是 type/size enum）
-    ints = []
-    for j in range(len(ctx) - 3):
-        v4 = struct.unpack_from("<I", ctx, j)[0]
-        if 1 <= v4 <= 20:
-            ints.append((ctx_start + j, v4))
-    if ints:
-        print(f"    small ints (possible enums): {ints[:10]}")
-    print()
+print(f"Int32*1e7 lat:    {len(lat_i)}  Int32*1e7 lon:    {len(lon_i)}")
 
-print(f"Total pairs found: {len(pairs)}")
+# -----------------------------------------------------------------------
+# 3. 配對：同一格式，距離 <= 200 bytes
+# -----------------------------------------------------------------------
+def find_pairs(lats, lons, window=200, label=""):
+    pairs = []
+    for lo, lv in lats:
+        for no, nv in lons:
+            if abs(no - lo) <= window:
+                pairs.append((lo, no, lv, nv, abs(no - lo)))
+    pairs.sort(key=lambda x: x[0])
+    if pairs:
+        print(f"\n=== Pairs ({label}, window={window}) ===")
+        seen = set()
+        for lo, no, lv, nv, d in pairs:
+            key = (round(lv, 3), round(nv, 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"  lat={lv:.6f}  lon={nv:.6f}  "
+                  f"(lat_off={lo}, lon_off={no}, dist={d})")
+            # 顯示周圍 bytes
+            start = max(0, min(lo, no) - 8)
+            end   = min(len(data), max(lo, no) + 16)
+            ctx   = data[start:end]
+            print(f"    hex: {ctx.hex()}")
+            # 小整數可能是 type/size enum
+            small = []
+            for j in range(0, len(ctx) - 3, 1):
+                vi = struct.unpack_from("<I", ctx, j)[0]
+                if 1 <= vi <= 20:
+                    small.append((start + j, vi))
+            if small:
+                print(f"    small ints (enum?): {small[:8]}")
+    return pairs
 
-# 如果沒有配對，直接印出所有 lon
-if not pairs:
-    print("\nNo pairs found. All lon candidates:")
-    for off, v in lon_offsets[:30]:
-        print(f"  offset={off:7d}  lon={v:.6f}")
-    print("\nAll lat candidates:")
-    for off, v in lat_offsets[:30]:
-        print(f"  offset={off:7d}  lat={v:.6f}")
+p1 = find_pairs(lat_d, lon_d, window=200, label="double+double")
+p2 = find_pairs(lat_i, lon_i, window=200, label="int32*1e7")
+p3 = find_pairs(lat_d, lon_i, window=200, label="double lat + int32 lon")
+p4 = find_pairs(lat_i, lon_d, window=200, label="int32 lat + double lon")
+
+total = len(p1) + len(p2) + len(p3) + len(p4)
+if total == 0:
+    print("\nNo pairs in any format. Printing all candidates:")
+    print("\nDouble lats:")
+    for o, v in lat_d[:15]:
+        print(f"  off={o:7d}  {v:.6f}")
+    print("\nDouble lons:")
+    for o, v in lon_d[:10]:
+        print(f"  off={o:7d}  {v:.6f}")
+    print("\nInt32*1e7 lats:")
+    for o, v in lat_i[:15]:
+        print(f"  off={o:7d}  {v:.6f}")
+    print("\nInt32*1e7 lons:")
+    for o, v in lon_i[:15]:
+        print(f"  off={o:7d}  {v:.6f}")
