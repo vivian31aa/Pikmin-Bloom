@@ -32,14 +32,14 @@ def scan_doubles(data: bytes):
     results = []
     dv = memoryview(data).cast('B')
     n = len(data)
-    for i in range(0, n - 15, 4):
+    for i in range(0, n - 15, 1):  # step=1: protobuf doubles are not 4-byte aligned
         try:
             lat = struct.unpack_from('<d', data, i)[0]
         except Exception:
             continue
         if not math.isfinite(lat) or not (LAT_MIN <= lat <= LAT_MAX):
             continue
-        for delta in (8, 16, -8, -16):
+        for delta in (8, 16, -8, -16, 24, -24):
             j = i + delta
             if j < 0 or j + 8 > n:
                 continue
@@ -57,7 +57,7 @@ def scan_int7(data: bytes):
     """掃描 int32*1e7 編碼的台灣座標對。"""
     results = []
     n = len(data)
-    for i in range(0, n - 7, 4):
+    for i in range(0, n - 7, 1):  # step=1 for unaligned protobuf fields
         try:
             v = struct.unpack_from('<i', data, i)[0]
         except Exception:
