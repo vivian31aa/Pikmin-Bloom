@@ -30,6 +30,8 @@ function sendBuf(label, alg, bytes) {
 }
 
 // ── 1. SSL_read — fixed: save buf pointer in onEnter ─────────────────────────
+let rpc2LargeDetected = false;  // flag to trigger auto memory scan
+
 (function() {
     const fn = Module.findExportByName("libssl.so", "SSL_read");
     if (!fn) { console.log("[-] SSL_read not found"); return; }
@@ -69,6 +71,19 @@ function sendBuf(label, alg, bytes) {
                 for (const c of acc.chunks) { full.set(c, off); off += c.length; }
                 sslBufs.delete(this.ssl);
                 sendBuf("SSL_read(ssl=..." + this.ssl.slice(-6) + ")", "tls-raw", full);
+
+                // If this looks like a large rpc2 response, schedule memory scan
+                // after a 3-second delay (time for game to decrypt and store in memory)
+                if (full.length > 40000 && !rpc2LargeDetected) {
+                    rpc2LargeDetected = true;
+                    console.log("[SSL_read] large response detected (" + full.length + " bytes) — auto-scan in 3s");
+                    setTimeout(function() {
+                        console.log("[auto-scan] starting scan_plaintext after rpc2...");
+                        scan_plaintext(50000);
+                        scan_fb();
+                        rpc2LargeDetected = false;  // allow next trigger
+                    }, 3000);
+                }
             }
         }
     });
@@ -220,28 +235,46 @@ global.scan_fb = function() {
 };
 
 // ── 6. scan_plaintext: find low-entropy (decrypted) large regions ─────────────
-global.scan_plaintext = function(minSize) {
-    minSize = minSize || 80000;
-    console.log("[*] scan_plaintext: looking for H<5.5 regions >= " + minSize + " bytes...");
+// Also look for FlatBuffers-like root_off in each region header
+global.scan_plaintext = function(minSize, maxH) {
+    minSize = minSize || 50000;
+    maxH    = maxH    || 7.0;     // raised from 5.5 to catch denser data
+    console.log("[*] scan_plaintext: H<" + maxH + " regions >= " + minSize + " bytes...");
     let found = 0;
-    Process.enumerateRanges("r--").concat(Process.enumerateRanges("rw-")).forEach(r => {
+    const perms = ["r--", "rw-", "rwx"];
+    const seen  = new Set();
+    perms.forEach(p => {
+        try { Process.enumerateRanges(p).forEach(r => { if (!seen.has(r.base.toString())) seen.set(r.base.toString(), r); }); }
+        catch(_) {}
+    });
+    // Iterate unique ranges
+    Process.enumerateRanges("r--").concat(Process.enumerateRanges("rw-")).concat(Process.enumerateRanges("rwx")).forEach(r => {
         if (r.size < minSize || r.size > 100*1024*1024) return;
         try {
             // Sample 3 x 512-byte windows for entropy estimate
             const freq = new Array(256).fill(0);
             let total = 0;
             for (const off of [0, Math.floor(r.size/2), r.size - 512]) {
+                if (off < 0 || off + 512 > r.size) continue;
                 const s = new Uint8Array(r.base.add(off).readByteArray(512));
                 for (const b of s) freq[b]++;
                 total += 512;
             }
+            if (total === 0) return;
             let h = 0;
             for (const c of freq) if (c > 0) { const p = c/total; h -= p * Math.log2(p); }
-            if (h < 5.5) {
-                const preview = new Uint8Array(r.base.readByteArray(64));
-                console.log("  LOW-ENTROPY @ " + r.base + " size=" + r.size + " H=" + h.toFixed(2));
-                console.log("    " + hexOf(preview, 32));
-                found++;
+            if (h >= maxH) return;
+
+            const preview = new Uint8Array(r.base.readByteArray(Math.min(64, r.size)));
+            const u32 = preview[0]|(preview[1]<<8)|(preview[2]<<16)|(preview[3]<<24);
+            const isFB = (u32 > 0 && u32 < 2000);  // possible FlatBuffers root_off
+            const tag  = isFB ? " *** FB root_off=" + u32 : "";
+
+            console.log("  H=" + h.toFixed(2) + " sz=" + r.size + " perm=" + r.protection +
+                        " @ " + r.base + tag);
+            console.log("    " + hexOf(preview, 32));
+            found++;
+            if (r.size >= minSize) {
                 sendBuf("plaintext@" + r.base, "raw_H" + h.toFixed(1), new Uint8Array(r.base.readByteArray(r.size)));
             }
         } catch(_) {}
