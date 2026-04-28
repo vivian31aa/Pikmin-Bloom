@@ -9,6 +9,10 @@
 const MIN_DUMP_SIZE = 50000;
 let dumpIndex = 0;
 
+// malloc/free tracker — armed after large SSL_read to catch decrypted buffer
+let trackMalloc = false;
+const largeAllocs = new Map();  // ptr_str → size
+
 function hexOf(arr, n) {
     n = Math.min(n || 32, arr.length);
     let s = "";
@@ -72,17 +76,17 @@ let rpc2LargeDetected = false;  // flag to trigger auto memory scan
                 sslBufs.delete(this.ssl);
                 sendBuf("SSL_read(ssl=..." + this.ssl.slice(-6) + ")", "tls-raw", full);
 
-                // If this looks like a large rpc2 response, schedule memory scan
-                // after a 3-second delay (time for game to decrypt and store in memory)
+                // When large rpc2 chunk arrives: arm malloc tracker + schedule coord scan
                 if (full.length > 40000 && !rpc2LargeDetected) {
                     rpc2LargeDetected = true;
-                    console.log("[SSL_read] large response detected (" + full.length + " bytes) — auto-scan in 3s");
+                    trackMalloc = true;
+                    console.log("[SSL_read] large rpc2 chunk (" + full.length + " bytes) — arming malloc tracker, scan_coords in 5s");
                     setTimeout(function() {
-                        console.log("[auto-scan] starting scan_plaintext after rpc2...");
-                        scan_plaintext(50000);
-                        scan_fb();
-                        rpc2LargeDetected = false;  // allow next trigger
-                    }, 3000);
+                        trackMalloc = false;
+                        console.log("[auto-scan] running scan_coords...");
+                        scan_coords();
+                        rpc2LargeDetected = false;
+                    }, 5000);
                 }
             }
         }
@@ -344,12 +348,90 @@ global.scan_plaintext = function(minSize, maxH) {
     console.log("[*] NianticPlugin EVP scan done: " + hooked + " candidates hooked");
 })();
 
+// ── 8. scan_coords: scan all readable memory for Taiwan lat/lon double pairs ────
+global.scan_coords = function() {
+    console.log("[*] scan_coords: scanning for lat∈[20,27] lon∈[118,125] doubles...");
+    let found = 0;
+    const perms = ["r--", "rw-"];
+    const ranges = [];
+    perms.forEach(p => { try { Process.enumerateRanges(p).forEach(r => ranges.push(r)); } catch(_) {} });
+
+    for (const r of ranges) {
+        if (r.size < 16 || r.size > 200*1024*1024) continue;
+        let data;
+        try { data = r.base.readByteArray(r.size); }
+        catch(_) { continue; }
+        const dv = new DataView(data);
+        for (let i = 0; i <= data.byteLength - 16; i += 4) {
+            let lat;
+            try { lat = dv.getFloat64(i, true); } catch(_) { continue; }
+            if (lat < 20.0 || lat > 27.0) continue;
+            for (const delta of [8, 16, -8, -16]) {
+                const j = i + delta;
+                if (j < 0 || j + 8 > data.byteLength) continue;
+                let lon;
+                try { lon = dv.getFloat64(j, true); } catch(_) { continue; }
+                if (lon < 118.0 || lon > 125.0) continue;
+                console.log("  COORD @ " + r.base.add(i) + " (" + r.protection + ")" +
+                    " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6) + " Δ=" + delta);
+                // Dump 256 bytes of context
+                const ctx_off = Math.max(0, i - 32);
+                const ctx_len = Math.min(256, data.byteLength - ctx_off);
+                const ctx = new Uint8Array(data, ctx_off, ctx_len);
+                console.log("    ctx: " + hexOf(ctx, 48));
+                found++;
+                if (found >= 30) { console.log("  (capped at 30)"); return; }
+                break;
+            }
+        }
+    }
+    console.log("[*] scan_coords done: " + found + " pairs found");
+};
+
+// ── 9. malloc/free hook — captures large buffers just before free() ───────────
+(function hookMallocFree() {
+    const mallocFn = Module.findExportByName("libc.so", "malloc");
+    const freeFn   = Module.findExportByName("libc.so", "free");
+    if (!mallocFn || !freeFn) { console.log("[-] malloc/free not in libc.so"); return; }
+
+    Interceptor.attach(mallocFn, {
+        onEnter(a) { this.sz = a[0].toUInt32(); },
+        onLeave(ret) {
+            if (!trackMalloc || this.sz < 50000 || this.sz > 1000000 || ret.isNull()) return;
+            largeAllocs.set(ret.toString(), this.sz);
+        }
+    });
+
+    Interceptor.attach(freeFn, {
+        onEnter(args) {
+            const key = args[0].toString();
+            const sz  = largeAllocs.get(key);
+            if (!sz) return;
+            largeAllocs.delete(key);
+            try {
+                const sample = new Uint8Array(args[0].readByteArray(Math.min(sz, 512)));
+                const freq = new Array(256).fill(0);
+                for (const b of sample) freq[b]++;
+                let h = 0;
+                for (const c of freq) if (c > 0) { const p = c/sample.length; h -= p * Math.log2(p); }
+                const u32 = sample[0]|(sample[1]<<8)|(sample[2]<<16)|(sample[3]<<24);
+                console.log("[pre-free] sz=" + sz + " H=" + h.toFixed(2) + " u32=" + u32 + " @ " + key);
+                if (h < 7.5) {
+                    sendBuf("pre_free@" + key, "H" + h.toFixed(1), new Uint8Array(args[0].readByteArray(sz)));
+                }
+            } catch(_) {}
+        }
+    });
+    console.log("[+] malloc/free hooked (tracking when armed)");
+})();
+
 // Expose functions to Python via rpc.exports
 rpc.exports = {
     scanFb:          function() { scan_fb(); },
     scanPlaintext:   function(minSize) { scan_plaintext(minSize); },
+    scanCoords:      function() { scan_coords(); },
     evalJs:          function(code) { return eval(code); },
 };
 
 console.log("[*] All hooks loaded. Waiting for rpc2...");
-console.log("[*] REPL: scan_fb() | scan_plaintext() | eval(<js>)");
+console.log("[*] REPL: scan_coords() | scan_fb() | scan_plaintext() | eval(<js>)");

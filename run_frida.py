@@ -212,7 +212,7 @@ def main():
 
     # Simple REPL — runs in a background thread so on_message still fires
     def repl():
-        print("[REPL] Commands: scan_fb()  eval(<js>)  quit")
+        print("[REPL] Commands: scan_coords()  scan_fb()  scan_plaintext()  eval(<js>)  quit")
         while not detached.is_set():
             try:
                 line = input("js> ").strip()
@@ -226,7 +226,9 @@ def main():
             if line in ("quit", "exit", "q"):
                 break
             try:
-                if line == "scan_fb()":
+                if line == "scan_coords()":
+                    script.exports_sync.scan_coords()
+                elif line == "scan_fb()":
                     script.exports_sync.scan_fb()
                 elif line.startswith("scan_plaintext"):
                     import re as _re
