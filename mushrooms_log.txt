@@ -1,0 +1,4 @@
+
+=== 068_pre_free@0xb40000750cdf79b0_325200.bin  size=325,200  coords=164 ===
+
+Total unique mushrooms across all files: 164
