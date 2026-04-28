@@ -16,7 +16,50 @@ const capturedAddrs = new Set();  // deduplicate: only dump each addr once per s
 const largeAllocs = new Map();  // ptr_str → size
 const smallAllocs = new Map();  // ptr_str → size (1000-50000 byte range)
 
-function hexOf(arr, n) {
+// ---------------------------------------------------------------------------
+// ART/Dalvik heap range exclusion — read once, used by all coord scanners
+// ---------------------------------------------------------------------------
+let _artRanges = null;  // [{base: ptr, end: ptr}]
+
+function getArtRanges() {
+    if (_artRanges) return _artRanges;
+    _artRanges = [];
+    try {
+        const maps = require("fs").readFileSync("/proc/self/maps", "utf8");
+        for (const line of maps.split("\n")) {
+            // Match dalvik-main space, dalvik-large object space, .art files, etc.
+            if (!line.includes("dalvik-") && !line.includes(".art ") &&
+                !line.includes("jit-code-cache") && !line.includes("indirect ref")) continue;
+            const m = line.match(/^([0-9a-f]+)-([0-9a-f]+)/);
+            if (!m) continue;
+            _artRanges.push({ base: ptr(m[1]), end: ptr(m[2]) });
+        }
+    } catch(_) {}
+    console.log("[*] ART exclusion ranges loaded: " + _artRanges.length);
+    return _artRanges;
+}
+
+function isArtAddress(p) {
+    const artRanges = getArtRanges();
+    for (const r of artRanges) {
+        if (p.compare(r.base) >= 0 && p.compare(r.end) < 0) return true;
+    }
+    return false;
+}
+
+// ASCII density of a context window: fraction of bytes in printable ASCII range
+function asciiDensity(arr, off, len) {
+    len = Math.min(len, arr.length - off);
+    if (len <= 0) return 0;
+    let cnt = 0;
+    for (let i = off; i < off + len; i++) {
+        const b = arr[i];
+        if (b >= 0x20 && b < 0x7f) cnt++;
+    }
+    return cnt / len;
+}
+
+
     n = Math.min(n || 32, arr.length);
     let s = "";
     for (let i = 0; i < n; i++) s += ("0" + (arr[i] & 0xff).toString(16)).slice(-2) + " ";
@@ -486,13 +529,14 @@ global.scan_coords = function() {
 // ── 10. scan_int7: scan all readable memory for int32×1e7 Taiwan coord pairs ────
 global.scan_int7 = function(cap) {
     cap = cap || 60;
-    console.log("[*] scan_int7: lat∈[200M,270M] lon∈[1180M,1255M] int32 pairs...");
-    let found = 0;
+    console.log("[*] scan_int7: lat∈[200M,270M] lon∈[1180M,1255M] int32 pairs (excl. ART)...");
+    let found = 0, skippedArt = 0;
     const ranges = [];
     ["r--", "rw-"].forEach(p => { try { Process.enumerateRanges(p).forEach(r => ranges.push(r)); } catch(_) {} });
 
     for (const r of ranges) {
         if (r.size < 8 || r.size > 200*1024*1024) continue;
+        if (isArtAddress(r.base)) { skippedArt++; continue; }
         let data;
         try { data = r.base.readByteArray(r.size); } catch(_) { continue; }
         const dv = new DataView(data);
@@ -509,11 +553,14 @@ global.scan_int7 = function(cap) {
                 try { w = dv.getInt32(j, true); } catch(_) { continue; }
                 if (w >= 1_180_000_000 && w <= 1_255_000_000) {
                     const lat = v / 1e7, lon = w / 1e7;
-                    console.log("  INT7 @ " + r.base.add(i) + " (" + r.protection + ")" +
-                                " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6) + " Δ=" + delta);
                     const ctxOff = Math.max(0, i - 24);
                     const ctxLen = Math.min(80, n - ctxOff);
-                    console.log("    ctx: " + hexOf(new Uint8Array(data, ctxOff, ctxLen), 48));
+                    const ctx = new Uint8Array(data, ctxOff, ctxLen);
+                    // Skip if context looks like a string table (>55% ASCII)
+                    if (asciiDensity(ctx, 0, ctxLen) > 0.55) break;
+                    console.log("  INT7 @ " + r.base.add(i) + " (" + r.protection + ")" +
+                                " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6) + " Δ=" + delta);
+                    console.log("    ctx: " + hexOf(ctx, 48));
                     found++;
                     if (found >= cap) { console.log("  (capped at " + cap + ")"); return; }
                     break;
@@ -521,19 +568,20 @@ global.scan_int7 = function(cap) {
             }
         }
     }
-    console.log("[*] scan_int7 done: " + found + " pairs found");
+    console.log("[*] scan_int7 done: " + found + " pairs found, " + skippedArt + " ART ranges skipped");
 };
 
 // ── 11. scan_mushroom_records: int7 lat+lon AND small int (type/size) in same 64B ─
 global.scan_mushroom_records = function(cap) {
     cap = cap || 100;
-    console.log("[*] scan_mushroom_records: int7 coord + nearby small int (1-200)...");
-    let found = 0;
+    console.log("[*] scan_mushroom_records: int7 coord + nearby small int (excl. ART/strings)...");
+    let found = 0, skippedArt = 0, skippedAscii = 0;
     const ranges = [];
     ["r--", "rw-"].forEach(p => { try { Process.enumerateRanges(p).forEach(r => ranges.push(r)); } catch(_) {} });
 
     for (const r of ranges) {
         if (r.size < 16 || r.size > 200*1024*1024) continue;
+        if (isArtAddress(r.base)) { skippedArt++; continue; }
         let data;
         try { data = r.base.readByteArray(r.size); } catch(_) { continue; }
         const dv = new DataView(data);
@@ -556,6 +604,13 @@ global.scan_mushroom_records = function(cap) {
 
             const lat = v / 1e7;
             const lon = dv.getInt32(lonOff, true) / 1e7;
+            const ctxOff = Math.max(0, Math.min(i, lonOff) - 32);
+            const ctxLen = Math.min(96, n - ctxOff);
+            const ctx = new Uint8Array(data, ctxOff, ctxLen);
+
+            // Skip if the 96-byte window looks like a string table (>50% ASCII printable)
+            if (asciiDensity(ctx, 0, ctxLen) > 0.50) { skippedAscii++; continue; }
+
             const searchStart = Math.max(0, Math.min(i, lonOff) - 32);
             const searchEnd   = Math.min(n - 4, Math.max(i, lonOff) + 36);
             const smallInts   = [];
@@ -571,15 +626,14 @@ global.scan_mushroom_records = function(cap) {
                         " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6));
             for (const si of smallInts)
                 console.log("    small[" + (si.rel >= 0 ? "+" : "") + si.rel + "] = " + si.val);
-            const ctxOff = Math.max(0, Math.min(i, lonOff) - 32);
-            const ctxLen = Math.min(96, n - ctxOff);
-            console.log("    ctx: " + hexOf(new Uint8Array(data, ctxOff, ctxLen), 64));
+            console.log("    ctx: " + hexOf(ctx, 64));
 
             found++;
             if (found >= cap) { console.log("  (capped at " + cap + ")"); return; }
         }
     }
-    console.log("[*] scan_mushroom_records done: " + found + " candidates");
+    console.log("[*] scan_mushroom_records done: " + found + " candidates" +
+                " (skipped: " + skippedArt + " ART, " + skippedAscii + " string-table)");
 };
 
 // Expose functions to Python via rpc.exports
