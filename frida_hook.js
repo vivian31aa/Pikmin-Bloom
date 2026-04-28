@@ -11,6 +11,7 @@ let dumpIndex = 0;
 
 // malloc/free tracker — armed after large SSL_read to catch decrypted buffer
 let trackMalloc = false;
+const capturedAddrs = new Set();  // deduplicate: only dump each addr once per session
 const largeAllocs = new Map();  // ptr_str → size
 
 function hexOf(arr, n) {
@@ -365,13 +366,14 @@ global.scan_coords = function() {
         for (let i = 0; i <= data.byteLength - 16; i += 4) {
             let lat;
             try { lat = dv.getFloat64(i, true); } catch(_) { continue; }
-            if (lat < 20.0 || lat > 27.0) continue;
+            // NaN passes (lat < 20 || lat > 27) because all NaN comparisons are false
+            if (!isFinite(lat) || lat < 20.0 || lat > 27.0) continue;
             for (const delta of [8, 16, -8, -16]) {
                 const j = i + delta;
                 if (j < 0 || j + 8 > data.byteLength) continue;
                 let lon;
                 try { lon = dv.getFloat64(j, true); } catch(_) { continue; }
-                if (lon < 118.0 || lon > 125.0) continue;
+                if (!isFinite(lon) || lon < 118.0 || lon > 125.0) continue;
                 console.log("  COORD @ " + r.base.add(i) + " (" + r.protection + ")" +
                     " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6) + " Δ=" + delta);
                 // Dump 256 bytes of context
@@ -408,6 +410,7 @@ global.scan_coords = function() {
             const sz  = largeAllocs.get(key);
             if (!sz) return;
             largeAllocs.delete(key);
+            if (capturedAddrs.has(key)) return;  // skip already-dumped address
             try {
                 const sample = new Uint8Array(args[0].readByteArray(Math.min(sz, 512)));
                 const freq = new Array(256).fill(0);
@@ -417,6 +420,7 @@ global.scan_coords = function() {
                 const u32 = sample[0]|(sample[1]<<8)|(sample[2]<<16)|(sample[3]<<24);
                 console.log("[pre-free] sz=" + sz + " H=" + h.toFixed(2) + " u32=" + u32 + " @ " + key);
                 if (h < 7.5) {
+                    capturedAddrs.add(key);
                     sendBuf("pre_free@" + key, "H" + h.toFixed(1), new Uint8Array(args[0].readByteArray(sz)));
                 }
             } catch(_) {}
