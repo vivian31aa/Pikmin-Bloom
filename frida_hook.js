@@ -1,12 +1,12 @@
 /**
  * frida_hook.js
- * Hook ALL libcrypto.so instances for EVP_Decrypt* (BoringSSL).
- * libNianticLabsPlugin.so calls into one of the three libcrypto.so copies.
+ * Capture Pikmin Bloom rpc2 response (encrypted) and decrypted payload.
+ * Confirmed: game uses java.net.URL → native TLS → libNianticLabsPlugin.so decrypt
  */
 
 "use strict";
 
-const MIN_DUMP_SIZE = 50000;   // rpc2 payload is ~315KB
+const MIN_DUMP_SIZE = 50000;
 let dumpIndex = 0;
 
 function hexOf(arr, n) {
@@ -17,27 +17,71 @@ function hexOf(arr, n) {
 }
 
 function sendBuf(label, alg, bytes) {
-    if (bytes.length < MIN_DUMP_SIZE) return;
+    if (!bytes || bytes.length < MIN_DUMP_SIZE) return;
     const idx = dumpIndex++;
-    console.log("\n[CAPTURED] " + label + "  alg=" + alg + "  len=" + bytes.length);
+    console.log("\n[CAPTURED] " + label + "  len=" + bytes.length);
     console.log("  preview: " + hexOf(bytes, 32));
     if (bytes.length >= 4) {
-        const u32 = bytes[0] | (bytes[1]<<8) | (bytes[2]<<16) | (bytes[3]<<24);
+        const u32 = bytes[0]|(bytes[1]<<8)|(bytes[2]<<16)|(bytes[3]<<24);
         if (u32 > 0 && u32 < 500) console.log("  ** FlatBuffers root_off=" + u32);
     }
-    send({ type: "buffer", index: idx, label: label, alg: alg, len: bytes.length },
+    send({ type:"buffer", index:idx, label:label, alg:alg, len:bytes.length },
          bytes.buffer || bytes);
 }
 
-// ── Hook all instances of libcrypto.so ────────────────────────────────────────
-const accumulator = new Map();  // ctx_addr → Uint8Array[]
+// ── 1. SSL_read — fixed: save buf pointer in onEnter ─────────────────────────
+(function() {
+    const fn = Module.findExportByName("libssl.so", "SSL_read");
+    if (!fn) { console.log("[-] SSL_read not found"); return; }
+
+    // Accumulate chunks per SSL* context
+    const sslBufs = new Map();   // ssl_ptr_str → {chunks, totalLen}
+
+    Interceptor.attach(fn, {
+        onEnter(args) {
+            this.ssl = args[0].toString();
+            this.buf = args[1];          // save buffer pointer here
+            this.num = args[2].toInt32();
+        },
+        onLeave(retval) {
+            const n = retval.toInt32();
+            if (n <= 0) return;
+
+            let chunk;
+            try { chunk = new Uint8Array(this.buf.readByteArray(n)); }
+            catch(_) { return; }
+
+            // Log first read per SSL context
+            if (!sslBufs.has(this.ssl)) {
+                sslBufs.set(this.ssl, { chunks: [], totalLen: 0 });
+                console.log("[SSL_read] new ctx ssl=" + this.ssl.slice(-6) +
+                            "  first_n=" + n + "  preview: " + hexOf(chunk, 32));
+            }
+
+            const acc = sslBufs.get(this.ssl);
+            acc.chunks.push(chunk);
+            acc.totalLen += n;
+
+            // When we have >= MIN_DUMP_SIZE, emit the whole thing
+            if (acc.totalLen >= MIN_DUMP_SIZE) {
+                const full = new Uint8Array(acc.totalLen);
+                let off = 0;
+                for (const c of acc.chunks) { full.set(c, off); off += c.length; }
+                sslBufs.delete(this.ssl);
+                sendBuf("SSL_read(ssl=..." + this.ssl.slice(-6) + ")", "tls-raw", full);
+            }
+        }
+    });
+    console.log("[+] SSL_read hooked (accumulating per SSL context)");
+})();
+
+// ── 2. EVP_Decrypt* in all libcrypto.so ──────────────────────────────────────
+const evpAcc = new Map();
 
 function hookCryptoModule(mod) {
-    let foundUpdate = false, foundFinal = false;
-
+    let ok = false;
     mod.enumerateExports().forEach(exp => {
         if (exp.name === "EVP_DecryptUpdate") {
-            foundUpdate = true;
             Interceptor.attach(exp.address, {
                 onEnter(args) {
                     this.ctx    = args[0].toString();
@@ -47,186 +91,128 @@ function hookCryptoModule(mod) {
                 onLeave(ret) {
                     if (ret.toInt32() !== 1) return;
                     try {
-                        const written = this.lenPtr.readS32();
-                        if (written <= 0 || written > 50 * 1024 * 1024) return;
-                        const chunk = new Uint8Array(this.outPtr.readByteArray(written));
-                        if (!accumulator.has(this.ctx)) accumulator.set(this.ctx, []);
-                        accumulator.get(this.ctx).push(chunk);
-                        if (written > 10000) {
-                            console.log("[EVP_DecryptUpdate] " + mod.name +
-                                        "@" + mod.base + "  ctx=..." +
-                                        this.ctx.slice(-6) + "  written=" + written +
-                                        "  preview: " + hexOf(chunk, 24));
-                        }
+                        const w = this.lenPtr.readS32();
+                        if (w <= 0 || w > 50*1024*1024) return;
+                        const chunk = new Uint8Array(this.outPtr.readByteArray(w));
+                        if (!evpAcc.has(this.ctx)) evpAcc.set(this.ctx, []);
+                        evpAcc.get(this.ctx).push(chunk);
+                        if (w > 10000) console.log("[EVP_DecryptUpdate] " + mod.base +
+                            " ctx=..." + this.ctx.slice(-6) + " written=" + w);
                     } catch(_) {}
                 }
             });
+            ok = true;
         }
-
         if (exp.name === "EVP_DecryptFinal_ex") {
-            foundFinal = true;
             Interceptor.attach(exp.address, {
                 onEnter(args) { this.ctx = args[0].toString(); },
                 onLeave(ret) {
                     if (ret.toInt32() !== 1) return;
-                    const chunks = accumulator.get(this.ctx);
-                    accumulator.delete(this.ctx);
-                    if (!chunks || chunks.length === 0) return;
-
-                    const total = chunks.reduce((s, c) => s + c.length, 0);
-                    const full  = new Uint8Array(total);
+                    const chunks = evpAcc.get(this.ctx) || [];
+                    evpAcc.delete(this.ctx);
+                    if (!chunks.length) return;
+                    const total = chunks.reduce((s,c) => s+c.length, 0);
+                    const full = new Uint8Array(total);
                     let off = 0;
                     for (const c of chunks) { full.set(c, off); off += c.length; }
-
-                    console.log("[EVP_DecryptFinal_ex] " + mod.name +
-                                "  total_plaintext=" + total);
-                    sendBuf("EVP_Decrypt(" + mod.name + "@" + mod.base + ")",
-                            "AES-GCM/native", full);
+                    sendBuf("EVP_Decrypt(" + mod.base + ")", "AES-GCM", full);
                 }
             });
         }
     });
-
-    console.log("[+] " + mod.name + "@" + mod.base +
-                "  EVP_DecryptUpdate=" + foundUpdate +
-                "  EVP_DecryptFinal_ex=" + foundFinal);
+    if (ok) console.log("[+] EVP hooked: " + mod.name + "@" + mod.base);
 }
+Process.enumerateModules().filter(m => m.name === "libcrypto.so").forEach(hookCryptoModule);
 
-// Hook every libcrypto.so instance
-const cryptoMods = Process.enumerateModules().filter(m => m.name === "libcrypto.so");
-console.log("[*] Found " + cryptoMods.length + " libcrypto.so instance(s)");
-cryptoMods.forEach(hookCryptoModule);
-
-// ── Java Cipher (decrypt mode, >50KB, belt-and-suspenders) ───────────────────
+// ── 3. Java Cipher (all large outputs) ───────────────────────────────────────
 Java.perform(function() {
     try {
         const Cipher = Java.use("javax.crypto.Cipher");
-        const DECRYPT_MODE = 2;
-
         function fromJava(jArr) {
-            const arr = Java.array("byte", jArr);
-            const out = new Uint8Array(arr.length);
-            for (let i = 0; i < arr.length; i++) out[i] = arr[i] & 0xff;
-            return out;
+            const a = Java.array("byte", jArr);
+            const o = new Uint8Array(a.length);
+            for (let i = 0; i < a.length; i++) o[i] = a[i] & 0xff;
+            return o;
         }
-
-        // Save original overloads and call them to avoid recursion issues
         const orig1 = Cipher.doFinal.overload("[B");
-        const orig3 = Cipher.doFinal.overload("[B", "int", "int");
-
         orig1.implementation = function(input) {
-            const result = orig1.call(this, input);
-            // Capture all large outputs regardless of mode (decode_rpc2.py will check entropy)
-            if (result && result.length >= MIN_DUMP_SIZE) {
-                const alg = this.getAlgorithm ? this.getAlgorithm() : "?";
-                sendBuf("Java.Cipher", alg, fromJava(result));
-            }
-            return result;
+            const r = orig1.call(this, input);
+            if (r && r.length >= MIN_DUMP_SIZE)
+                sendBuf("Java.Cipher", this.getAlgorithm(), fromJava(r));
+            return r;
         };
+        console.log("[+] Java Cipher.doFinal hooked");
+    } catch(e) { console.log("[-] Java Cipher: " + e); }
 
-        orig3.implementation = function(input, off, len) {
-            const result = orig3.call(this, input, off, len);
-            if (result && result.length >= MIN_DUMP_SIZE) {
-                const alg = this.getAlgorithm ? this.getAlgorithm() : "?";
-                sendBuf("Java.Cipher/3", alg, fromJava(result));
-            }
-            return result;
-        };
-
-        console.log("[+] Java Cipher.doFinal hooked (decrypt + >" + MIN_DUMP_SIZE + " bytes)");
-    } catch(e) {
-        console.log("[-] Java Cipher hook: " + e);
-    }
-});
-
-// ── OkHttp3: log every HTTP request URL ──────────────────────────────────────
-Java.perform(function() {
-    // Hook Request.url() via Call execution
+    // ── 4. HttpURLConnection: capture rpc2 response stream ───────────────────
+    // Hook getInputStream(), wrap it to tee all bytes for rpc2 URLs
     try {
-        const OkHttpClient = Java.use("okhttp3.OkHttpClient");
-        const RealCall = Java.use("okhttp3.internal.connection.RealCall");
-        RealCall.execute.implementation = function() {
-            const url = this.request().url().toString();
-            console.log("[HTTP] " + this.request().method() + " " + url);
-            const resp = this.execute();
-            if (url.includes("rpc") || url.includes("niantic") || url.includes("ichigo")) {
-                const body = resp.body();
-                if (body) {
-                    const bytes = body.bytes();
-                    console.log("[HTTP] response len=" + bytes.length + "  url=" + url);
-                    if (bytes.length >= MIN_DUMP_SIZE) {
-                        const arr = Java.array("byte", bytes);
-                        const out = new Uint8Array(arr.length);
-                        for (let i = 0; i < arr.length; i++) out[i] = arr[i] & 0xff;
-                        sendBuf("HTTP.raw", url, out);
-                    }
-                }
-            }
-            return resp;
-        };
-        console.log("[+] OkHttp3 RealCall.execute hooked");
-    } catch(e) {
-        console.log("[-] OkHttp3 hook: " + e);
-    }
+        const HttpsConn = Java.use("javax.net.ssl.HttpsURLConnection");
+        HttpsConn.getInputStream.implementation = function() {
+            const stream = this.getInputStream();
+            try {
+                const url = this.getURL().toString();
+                if (!url.includes("rpc2") && !url.includes("ichigo")) return stream;
 
-    // Fallback: hook URL.openConnection
+                console.log("[HttpsConn] getInputStream for: " + url);
+                // Read entire response into byte array then re-wrap in a new stream
+                const ByteArrayOS = Java.use("java.io.ByteArrayOutputStream");
+                const baos = ByteArrayOS.$new();
+                const buf  = Java.array("byte", new Array(65536).fill(0));
+                let n;
+                while ((n = stream.read(buf)) !== -1) {
+                    baos.write(buf, 0, n);
+                }
+                const allBytes = baos.toByteArray();
+                console.log("[HttpsConn] rpc2 response len=" + allBytes.length);
+                sendBuf("HttpsConn.rpc2.raw", url, fromJavaArr(allBytes));
+
+                // Return a new stream wrapping the captured bytes
+                const ByteArrayIS = Java.use("java.io.ByteArrayInputStream");
+                return ByteArrayIS.$new(allBytes);
+            } catch(e2) {
+                console.log("[HttpsConn] tee error: " + e2);
+                return stream;
+            }
+        };
+
+        function fromJavaArr(jArr) {
+            const a = Java.array("byte", jArr);
+            const o = new Uint8Array(a.length);
+            for (let i = 0; i < a.length; i++) o[i] = a[i] & 0xff;
+            return o;
+        }
+        console.log("[+] HttpsURLConnection.getInputStream hooked");
+    } catch(e) { console.log("[-] HttpsURLConnection hook: " + e); }
+
+    // URL.openConnection for logging
     try {
         const URL = Java.use("java.net.URL");
         URL.openConnection.overload().implementation = function() {
             const s = this.toString();
-            if (s.includes("rpc") || s.includes("niantic") || s.includes("ichigo")) {
+            if (s.includes("rpc") || s.includes("ichigo") || s.includes("niantic"))
                 console.log("[URL] openConnection: " + s);
-            }
             return this.openConnection();
         };
-        console.log("[+] URL.openConnection hooked");
-    } catch(e) {
-        console.log("[-] URL.openConnection: " + e);
-    }
+    } catch(e) {}
 });
 
-// ── SSL_read: log large reads from ichigo-rel (native TLS layer) ──────────────
-(function hookSSL() {
-    const fn = Module.findExportByName("libssl.so", "SSL_read");
-    if (!fn) { console.log("[-] SSL_read not found"); return; }
-    const seenSizes = new Set();
-    Interceptor.attach(fn, {
-        onLeave(retval) {
-            const n = retval.toInt32();
-            if (n > 200) {
-                const bytes = new Uint8Array(this.context.x1.readByteArray(Math.min(n, 32)));
-                const preview = hexOf(bytes, 32);
-                if (!seenSizes.has(n)) {
-                    seenSizes.add(n);
-                    console.log("[SSL_read] n=" + n + "  preview: " + preview);
-                }
-            }
-        }
-    });
-    console.log("[+] SSL_read hooked");
-})();
-
-// ── Memory scan helper (call from REPL: scan_fb()) ───────────────────────────
-// Searches for decrypted FlatBuffers in process memory (low-entropy headers)
+// ── 5. Memory scan (call scan_fb() from REPL after map loads) ─────────────────
 global.scan_fb = function() {
-    console.log("[*] Scanning memory for FlatBuffers headers...");
-    let found = 0;
-    // Pattern: 14 00 00 00 00 00 0e 00 (outer FB header from rpc2)
-    const pattern = "14 00 00 00 00 00 0e 00";
+    console.log("[*] Scanning for FB headers...");
+    let n = 0;
     Process.enumerateRanges("r--").forEach(r => {
-        if (r.size < 100 || r.size > 200*1024*1024) return;
+        if (r.size < 1000 || r.size > 200*1024*1024) return;
         try {
-            Memory.scanSync(r.base, r.size, pattern).forEach(m => {
-                const bytes = new Uint8Array(m.address.readByteArray(32));
-                console.log("  FB @ " + m.address + ": " + hexOf(bytes, 32));
-                found++;
-                if (found <= 3) sendBuf("memscan", "flatbuffers", bytes);
+            Memory.scanSync(r.base, r.size, "14 00 00 00 00 00 0e 00").forEach(m => {
+                const b = new Uint8Array(m.address.readByteArray(32));
+                console.log("  FB @ " + m.address + ": " + hexOf(b, 32));
+                n++;
             });
         } catch(_) {}
     });
-    console.log("[*] Found " + found + " candidates");
+    console.log("[*] scan_fb done, found " + n);
 };
 
-console.log("[*] REPL: call scan_fb() after game loads to search memory");
-
-console.log("\n[*] Waiting for rpc2 decryption (trigger: open game map)...");
+console.log("[*] All hooks loaded. Waiting for rpc2...");
+console.log("[*] REPL: scan_fb() to search memory after map loads");
