@@ -139,22 +139,94 @@ Java.perform(function() {
     }
 });
 
-// ── List libNianticLabsPlugin.so exports related to crypto ───────────────────
-console.log("\n[*] libNianticLabsPlugin.so crypto-related exports:");
-const nianticMod = Process.enumerateModules().find(m => m.name === "libNianticLabsPlugin.so");
-if (nianticMod) {
-    const interesting = nianticMod.enumerateExports().filter(e => {
-        const n = e.name.toLowerCase();
-        return n.includes("decrypt") || n.includes("cipher") || n.includes("aes") ||
-               n.includes("crypto") || n.includes("rpc") || n.includes("proto");
-    });
-    if (interesting.length === 0) {
-        console.log("  (no matching exports — likely stripped)");
-    } else {
-        interesting.slice(0, 30).forEach(e => console.log("  " + e.name + "  @" + e.address));
+// ── OkHttp3: log every HTTP request URL ──────────────────────────────────────
+Java.perform(function() {
+    // Hook Request.url() via Call execution
+    try {
+        const OkHttpClient = Java.use("okhttp3.OkHttpClient");
+        const RealCall = Java.use("okhttp3.internal.connection.RealCall");
+        RealCall.execute.implementation = function() {
+            const url = this.request().url().toString();
+            console.log("[HTTP] " + this.request().method() + " " + url);
+            const resp = this.execute();
+            if (url.includes("rpc") || url.includes("niantic") || url.includes("ichigo")) {
+                const body = resp.body();
+                if (body) {
+                    const bytes = body.bytes();
+                    console.log("[HTTP] response len=" + bytes.length + "  url=" + url);
+                    if (bytes.length >= MIN_DUMP_SIZE) {
+                        const arr = Java.array("byte", bytes);
+                        const out = new Uint8Array(arr.length);
+                        for (let i = 0; i < arr.length; i++) out[i] = arr[i] & 0xff;
+                        sendBuf("HTTP.raw", url, out);
+                    }
+                }
+            }
+            return resp;
+        };
+        console.log("[+] OkHttp3 RealCall.execute hooked");
+    } catch(e) {
+        console.log("[-] OkHttp3 hook: " + e);
     }
-} else {
-    console.log("  libNianticLabsPlugin.so not found in module list");
-}
+
+    // Fallback: hook URL.openConnection
+    try {
+        const URL = Java.use("java.net.URL");
+        URL.openConnection.overload().implementation = function() {
+            const s = this.toString();
+            if (s.includes("rpc") || s.includes("niantic") || s.includes("ichigo")) {
+                console.log("[URL] openConnection: " + s);
+            }
+            return this.openConnection();
+        };
+        console.log("[+] URL.openConnection hooked");
+    } catch(e) {
+        console.log("[-] URL.openConnection: " + e);
+    }
+});
+
+// ── SSL_read: log large reads from ichigo-rel (native TLS layer) ──────────────
+(function hookSSL() {
+    const fn = Module.findExportByName("libssl.so", "SSL_read");
+    if (!fn) { console.log("[-] SSL_read not found"); return; }
+    const seenSizes = new Set();
+    Interceptor.attach(fn, {
+        onLeave(retval) {
+            const n = retval.toInt32();
+            if (n > 200) {
+                const bytes = new Uint8Array(this.context.x1.readByteArray(Math.min(n, 32)));
+                const preview = hexOf(bytes, 32);
+                if (!seenSizes.has(n)) {
+                    seenSizes.add(n);
+                    console.log("[SSL_read] n=" + n + "  preview: " + preview);
+                }
+            }
+        }
+    });
+    console.log("[+] SSL_read hooked");
+})();
+
+// ── Memory scan helper (call from REPL: scan_fb()) ───────────────────────────
+// Searches for decrypted FlatBuffers in process memory (low-entropy headers)
+global.scan_fb = function() {
+    console.log("[*] Scanning memory for FlatBuffers headers...");
+    let found = 0;
+    // Pattern: 14 00 00 00 00 00 0e 00 (outer FB header from rpc2)
+    const pattern = "14 00 00 00 00 00 0e 00";
+    Process.enumerateRanges("r--").forEach(r => {
+        if (r.size < 100 || r.size > 200*1024*1024) return;
+        try {
+            Memory.scanSync(r.base, r.size, pattern).forEach(m => {
+                const bytes = new Uint8Array(m.address.readByteArray(32));
+                console.log("  FB @ " + m.address + ": " + hexOf(bytes, 32));
+                found++;
+                if (found <= 3) sendBuf("memscan", "flatbuffers", bytes);
+            });
+        } catch(_) {}
+    });
+    console.log("[*] Found " + found + " candidates");
+};
+
+console.log("[*] REPL: call scan_fb() after game loads to search memory");
 
 console.log("\n[*] Waiting for rpc2 decryption (trigger: open game map)...");
