@@ -214,5 +214,11 @@ global.scan_fb = function() {
     console.log("[*] scan_fb done, found " + n);
 };
 
+// Expose functions to Python via rpc.exports
+rpc.exports = {
+    scanFb: function() { scan_fb(); },
+    evalJs:  function(code) { return eval(code); },  // generic eval for REPL
+};
+
 console.log("[*] All hooks loaded. Waiting for rpc2...");
-console.log("[*] REPL: scan_fb() to search memory after map loads");
+console.log("[*] REPL: type scan_fb() in the Python console after map loads");

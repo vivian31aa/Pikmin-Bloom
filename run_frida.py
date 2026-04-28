@@ -25,6 +25,7 @@ import sys
 import os
 import argparse
 import time
+import threading
 
 SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "frida_hook.js")
 DEFAULT_HOST = "127.0.0.1:27042"
@@ -201,17 +202,52 @@ def main():
     print(f"[*] Now open the game / trigger rpc2 (force-stop + restart).")
     print(f"[*] Press Ctrl-C to stop.\n")
 
+    detached = threading.Event()
+
     def on_detached(reason):
         print(f"\n[!] Session detached: {reason}")
+        detached.set()
 
     session.on("detached", on_detached)
 
+    # Simple REPL — runs in a background thread so on_message still fires
+    def repl():
+        print("[REPL] Commands: scan_fb()  eval(<js>)  quit")
+        while not detached.is_set():
+            try:
+                line = input("js> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                continue
+            if line in ("quit", "exit", "q"):
+                break
+            try:
+                if line == "scan_fb()":
+                    script.exports_sync.scan_fb()
+                else:
+                    # strip trailing ()  — eval arbitrary JS
+                    result = script.exports_sync.eval_js(line)
+                    if result is not None:
+                        print(f"  => {result}")
+            except Exception as e:
+                print(f"  [err] {e}")
+        detached.set()
+
+    t = threading.Thread(target=repl, daemon=True)
+    t.start()
+
     try:
-        while True:
-            time.sleep(1)
+        while not detached.is_set():
+            time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\n[*] Detaching...")
+        pass
+
+    print("\n[*] Detaching...")
+    try:
         session.detach()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
