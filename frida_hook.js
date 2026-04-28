@@ -254,46 +254,60 @@ global.scan_plaintext = function(minSize) {
     const plugin = Process.findModuleByName("libNianticLabsPlugin.so");
     if (!plugin) { console.log("[-] libNianticLabsPlugin.so not found"); return; }
 
-    // Use exported EVP_DecryptUpdate as reference for byte pattern
-    const refAddr = Module.findExportByName(null, "EVP_DecryptUpdate");
-    if (!refAddr) { console.log("[-] No exported EVP_DecryptUpdate for reference pattern"); return; }
+    // Get exported EVP_DecryptUpdate — may be a PLT stub (LDR X16,#8; BR X16)
+    const pltAddr = Module.findExportByName(null, "EVP_DecryptUpdate");
+    if (!pltAddr) { console.log("[-] No exported EVP_DecryptUpdate for reference"); return; }
 
-    // Read 16-byte prologue as scan pattern
-    const refArr = new Uint8Array(Memory.readByteArray(refAddr, 16));
-    let hexPat = "";
-    for (let i = 0; i < 16; i++) hexPat += ("0" + refArr[i].toString(16)).slice(-2) + " ";
-    hexPat = hexPat.trimEnd();
-    console.log("[*] EVP reference prologue: " + hexPat);
-    console.log("[*] Scanning libNianticLabsPlugin.so (" + (plugin.size/1024/1024).toFixed(1) + " MB) ...");
-
-    let hooked = 0;
+    // Detect PLT stub: first u32 == 0x58000050 (LDR X16, #8)
+    let realAddr = pltAddr;
     try {
-        Memory.scanSync(plugin.base, plugin.size, hexPat).forEach(m => {
-            // Skip if same address as the known export
-            if (m.address.equals(refAddr)) return;
-            console.log("[+] NianticPlugin EVP_DecryptUpdate candidate @ " + m.address);
-            Interceptor.attach(m.address, {
-                onEnter(args) {
-                    this.ctx    = args[0].toString();
-                    this.outPtr = args[1];
-                    this.lenPtr = args[2];
-                },
-                onLeave(ret) {
-                    if (ret.toInt32() !== 1) return;
-                    try {
-                        const w = this.lenPtr.readS32();
-                        if (w <= 0 || w > 50*1024*1024) return;
-                        const chunk = new Uint8Array(this.outPtr.readByteArray(w));
-                        if (!evpAcc.has(this.ctx)) evpAcc.set(this.ctx, []);
-                        evpAcc.get(this.ctx).push(chunk);
-                        if (w > 5000) console.log("[NianticEVP_Update] ctx=..." +
-                            this.ctx.slice(-6) + " written=" + w);
-                    } catch(_) {}
-                }
+        if (Memory.readU32(pltAddr) === 0x58000050) {
+            // PLT entry: real GOT pointer is 8 bytes ahead of stub
+            realAddr = Memory.readPointer(pltAddr.add(8));
+            console.log("[*] PLT stub → real EVP addr: " + realAddr);
+        }
+    } catch(_) {}
+
+    // Read 12-byte prologue of the real function as scan pattern
+    const refArr = new Uint8Array(Memory.readByteArray(realAddr, 12));
+    let hexPat = "";
+    for (let i = 0; i < 12; i++) hexPat += ("0" + refArr[i].toString(16)).slice(-2) + " ";
+    hexPat = hexPat.trimEnd();
+    console.log("[*] Real EVP prologue: " + hexPat);
+
+    // Scan only r-x (executable) ranges inside libNianticLabsPlugin.so
+    const pluginEnd = plugin.base.add(plugin.size);
+    let hooked = 0;
+    Process.enumerateRanges("r-x").forEach(r => {
+        if (r.base.compare(plugin.base) < 0 || r.base.compare(pluginEnd) >= 0) return;
+        console.log("[*] Scanning r-x range in NianticPlugin: " + r.base + " sz=" + r.size);
+        try {
+            Memory.scanSync(r.base, r.size, hexPat).forEach(m => {
+                if (m.address.equals(realAddr)) return;
+                console.log("[+] NianticPlugin EVP candidate @ " + m.address);
+                Interceptor.attach(m.address, {
+                    onEnter(args) {
+                        this.ctx    = args[0].toString();
+                        this.outPtr = args[1];
+                        this.lenPtr = args[2];
+                    },
+                    onLeave(ret) {
+                        if (ret.toInt32() !== 1) return;
+                        try {
+                            const w = this.lenPtr.readS32();
+                            if (w <= 0 || w > 50*1024*1024) return;
+                            const chunk = new Uint8Array(this.outPtr.readByteArray(w));
+                            if (!evpAcc.has(this.ctx)) evpAcc.set(this.ctx, []);
+                            evpAcc.get(this.ctx).push(chunk);
+                            if (w > 5000) console.log("[NianticEVP_Update] ctx=..." +
+                                this.ctx.slice(-6) + " written=" + w);
+                        } catch(_) {}
+                    }
+                });
+                hooked++;
             });
-            hooked++;
-        });
-    } catch(e) { console.log("[-] NianticPlugin scan error: " + e); }
+        } catch(e) { console.log("[-] Scan error @ " + r.base + ": " + e); }
+    });
     console.log("[*] NianticPlugin EVP scan done: " + hooked + " candidates hooked");
 })();
 
