@@ -218,6 +218,9 @@ def main():
                 line = input("js> ").strip()
             except (EOFError, KeyboardInterrupt):
                 break
+            # strip accidental prompt prefix if user copy-pasted "js> ..."
+            if line.startswith("js>"):
+                line = line[3:].strip()
             if not line:
                 continue
             if line in ("quit", "exit", "q"):
@@ -225,8 +228,12 @@ def main():
             try:
                 if line == "scan_fb()":
                     script.exports_sync.scan_fb()
+                elif line.startswith("scan_plaintext"):
+                    import re as _re
+                    m = _re.search(r'\((\d*)\)', line)
+                    sz = int(m.group(1)) if m and m.group(1) else None
+                    script.exports_sync.scan_plaintext(sz)
                 else:
-                    # strip trailing ()  — eval arbitrary JS
                     result = script.exports_sync.eval_js(line)
                     if result is not None:
                         print(f"  => {result}")

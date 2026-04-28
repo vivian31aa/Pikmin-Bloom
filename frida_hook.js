@@ -205,20 +205,104 @@ global.scan_fb = function() {
         if (r.size < 1000 || r.size > 200*1024*1024) return;
         try {
             Memory.scanSync(r.base, r.size, "14 00 00 00 00 00 0e 00").forEach(m => {
-                const b = new Uint8Array(m.address.readByteArray(32));
-                console.log("  FB @ " + m.address + ": " + hexOf(b, 32));
+                const b = new Uint8Array(m.address.readByteArray(64));
+                console.log("  FB @ " + m.address + " (region " + r.base + " sz=" + r.size + ")");
+                console.log("    " + hexOf(b, 64));
                 n++;
+                // Try to dump if large enough region
+                if (r.size >= MIN_DUMP_SIZE) {
+                    sendBuf("scan_fb@" + m.address, "FlatBuffers", new Uint8Array(r.base.readByteArray(r.size)));
+                }
             });
         } catch(_) {}
     });
     console.log("[*] scan_fb done, found " + n);
 };
 
+// ── 6. scan_plaintext: find low-entropy (decrypted) large regions ─────────────
+global.scan_plaintext = function(minSize) {
+    minSize = minSize || 80000;
+    console.log("[*] scan_plaintext: looking for H<5.5 regions >= " + minSize + " bytes...");
+    let found = 0;
+    Process.enumerateRanges("r--").concat(Process.enumerateRanges("rw-")).forEach(r => {
+        if (r.size < minSize || r.size > 100*1024*1024) return;
+        try {
+            // Sample 3 x 512-byte windows for entropy estimate
+            const freq = new Array(256).fill(0);
+            let total = 0;
+            for (const off of [0, Math.floor(r.size/2), r.size - 512]) {
+                const s = new Uint8Array(r.base.add(off).readByteArray(512));
+                for (const b of s) freq[b]++;
+                total += 512;
+            }
+            let h = 0;
+            for (const c of freq) if (c > 0) { const p = c/total; h -= p * Math.log2(p); }
+            if (h < 5.5) {
+                const preview = new Uint8Array(r.base.readByteArray(64));
+                console.log("  LOW-ENTROPY @ " + r.base + " size=" + r.size + " H=" + h.toFixed(2));
+                console.log("    " + hexOf(preview, 32));
+                found++;
+                sendBuf("plaintext@" + r.base, "raw_H" + h.toFixed(1), new Uint8Array(r.base.readByteArray(r.size)));
+            }
+        } catch(_) {}
+    });
+    console.log("[*] scan_plaintext done: " + found + " regions found");
+};
+
+// ── 7. Hook statically-linked BoringSSL inside libNianticLabsPlugin.so ─────────
+(function hookNianticCrypto() {
+    const plugin = Process.findModuleByName("libNianticLabsPlugin.so");
+    if (!plugin) { console.log("[-] libNianticLabsPlugin.so not found"); return; }
+
+    // Use exported EVP_DecryptUpdate as reference for byte pattern
+    const refAddr = Module.findExportByName(null, "EVP_DecryptUpdate");
+    if (!refAddr) { console.log("[-] No exported EVP_DecryptUpdate for reference pattern"); return; }
+
+    // Read 16-byte prologue as scan pattern
+    const refArr = new Uint8Array(Memory.readByteArray(refAddr, 16));
+    let hexPat = "";
+    for (let i = 0; i < 16; i++) hexPat += ("0" + refArr[i].toString(16)).slice(-2) + " ";
+    hexPat = hexPat.trimEnd();
+    console.log("[*] EVP reference prologue: " + hexPat);
+    console.log("[*] Scanning libNianticLabsPlugin.so (" + (plugin.size/1024/1024).toFixed(1) + " MB) ...");
+
+    let hooked = 0;
+    try {
+        Memory.scanSync(plugin.base, plugin.size, hexPat).forEach(m => {
+            // Skip if same address as the known export
+            if (m.address.equals(refAddr)) return;
+            console.log("[+] NianticPlugin EVP_DecryptUpdate candidate @ " + m.address);
+            Interceptor.attach(m.address, {
+                onEnter(args) {
+                    this.ctx    = args[0].toString();
+                    this.outPtr = args[1];
+                    this.lenPtr = args[2];
+                },
+                onLeave(ret) {
+                    if (ret.toInt32() !== 1) return;
+                    try {
+                        const w = this.lenPtr.readS32();
+                        if (w <= 0 || w > 50*1024*1024) return;
+                        const chunk = new Uint8Array(this.outPtr.readByteArray(w));
+                        if (!evpAcc.has(this.ctx)) evpAcc.set(this.ctx, []);
+                        evpAcc.get(this.ctx).push(chunk);
+                        if (w > 5000) console.log("[NianticEVP_Update] ctx=..." +
+                            this.ctx.slice(-6) + " written=" + w);
+                    } catch(_) {}
+                }
+            });
+            hooked++;
+        });
+    } catch(e) { console.log("[-] NianticPlugin scan error: " + e); }
+    console.log("[*] NianticPlugin EVP scan done: " + hooked + " candidates hooked");
+})();
+
 // Expose functions to Python via rpc.exports
 rpc.exports = {
-    scanFb: function() { scan_fb(); },
-    evalJs:  function(code) { return eval(code); },  // generic eval for REPL
+    scanFb:          function() { scan_fb(); },
+    scanPlaintext:   function(minSize) { scan_plaintext(minSize); },
+    evalJs:          function(code) { return eval(code); },
 };
 
 console.log("[*] All hooks loaded. Waiting for rpc2...");
-console.log("[*] REPL: type scan_fb() in the Python console after map loads");
+console.log("[*] REPL: scan_fb() | scan_plaintext() | eval(<js>)");
