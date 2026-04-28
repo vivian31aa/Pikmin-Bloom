@@ -5,14 +5,17 @@ Attach frida_hook.js to Pikmin Bloom via TCP (bypasses macOS simmy crash).
 
 Usage:
   # 1. Make sure frida-server is running on the emulator:
-  #    adb shell su -c "/data/local/tmp/frida-server &"
+  #    adb root
+  #    adb shell /data/local/tmp/frida-server &
+  #    adb shell setenforce 0
   #
   # 2. Forward the port:
   #    adb forward tcp:27042 tcp:27042
   #
   # 3. Run this script:
-  #    python run_frida.py
-  #    python run_frida.py --host 127.0.0.1:27042 --name "Pikmin Bloom"
+  #    python run_frida.py            # attach mode (app already running)
+  #    python run_frida.py --spawn    # spawn mode (kills + restarts app, bypasses anti-tamper)
+  #    python run_frida.py --list     # list processes
 
 pip install frida
 """
@@ -60,6 +63,8 @@ def main():
     parser.add_argument("--host", default=DEFAULT_HOST, help="frida-server host:port")
     parser.add_argument("--name", default=None, help="Process name (auto-detect if omitted)")
     parser.add_argument("--pid", type=int, default=None, help="Process PID")
+    parser.add_argument("--spawn", action="store_true",
+                        help="Spawn app fresh instead of attaching (bypasses anti-tamper)")
     parser.add_argument("--list", action="store_true", help="List processes and exit")
     args = parser.parse_args()
 
@@ -84,33 +89,62 @@ def main():
             print(f"{p.pid:>7}  {p.name}")
         return
 
-    # Find target process
-    if args.pid:
-        pid = args.pid
-        name = f"PID {pid}"
-    elif args.name:
-        match = next((p for p in procs if args.name.lower() in p.name.lower()), None)
-        if not match:
-            print(f"[-] Process '{args.name}' not found. Running processes:")
-            for p in sorted(procs, key=lambda x: x.name.lower()):
-                print(f"  {p.pid:>7}  {p.name}")
+    # Spawn mode: kill existing instance and launch fresh
+    if args.spawn:
+        pkg = "com.nianticlabs.pikminbloom"
+        print(f"[*] Spawn mode: killing existing '{pkg}' if running ...")
+        try:
+            for p in procs:
+                if "pikmin" in p.name.lower():
+                    device.kill(p.pid)
+                    print(f"    Killed PID {p.pid}")
+                    time.sleep(1)
+        except Exception:
+            pass
+        print(f"[*] Spawning '{pkg}' ...")
+        try:
+            pid = device.spawn([pkg])
+            name = pkg
+        except Exception as e:
+            print(f"[-] Spawn failed: {e}")
             sys.exit(1)
-        pid, name = match.pid, match.name
+        print(f"[+] Spawned PID={pid}")
+        print(f"[*] Attaching before app initialises ...")
+        try:
+            session = device.attach(pid)
+        except Exception as e:
+            print(f"[-] Attach failed: {e}")
+            sys.exit(1)
     else:
-        match = find_pikmin_process(device)
-        if not match:
-            print("[-] Pikmin Bloom not found. All processes:")
-            for p in sorted(procs, key=lambda x: x.name.lower()):
-                print(f"  {p.pid:>7}  {p.name}")
-            sys.exit(1)
-        pid, name = match.pid, match.name
+        # Attach mode: find running process
+        if args.pid:
+            pid = args.pid
+            name = f"PID {pid}"
+        elif args.name:
+            match = next((p for p in procs if args.name.lower() in p.name.lower()), None)
+            if not match:
+                print(f"[-] Process '{args.name}' not found. Running processes:")
+                for p in sorted(procs, key=lambda x: x.name.lower()):
+                    print(f"  {p.pid:>7}  {p.name}")
+                sys.exit(1)
+            pid, name = match.pid, match.name
+        else:
+            match = find_pikmin_process(device)
+            if not match:
+                print("[-] Pikmin Bloom not found. All processes:")
+                for p in sorted(procs, key=lambda x: x.name.lower()):
+                    print(f"  {p.pid:>7}  {p.name}")
+                sys.exit(1)
+            pid, name = match.pid, match.name
 
-    print(f"[*] Attaching to '{name}' (PID={pid}) ...")
-    try:
-        session = device.attach(pid)
-    except Exception as e:
-        print(f"[-] Attach failed: {e}")
-        sys.exit(1)
+        print(f"[*] Attaching to '{name}' (PID={pid}) ...")
+        try:
+            session = device.attach(pid)
+        except Exception as e:
+            print(f"[-] Attach failed: {e}")
+            print("    Tip: try --spawn mode to inject before anti-tamper runs:")
+            print("         python run_frida.py --spawn")
+            sys.exit(1)
 
     print(f"[+] Attached!")
 
@@ -132,6 +166,11 @@ def main():
         sys.exit(1)
 
     print(f"[+] frida_hook.js loaded and running.")
+
+    # In spawn mode, resume the app now that the script is injected
+    if args.spawn:
+        device.resume(pid)
+        print(f"[+] App resumed — Pikmin Bloom is now starting with hooks active")
     print(f"[*] Decrypted buffers will be saved to /sdcard/pikmin_decrypted/")
     print(f"[*] Now open the game / trigger rpc2 (force-stop + restart).")
     print(f"[*] Press Ctrl-C to stop.\n")
