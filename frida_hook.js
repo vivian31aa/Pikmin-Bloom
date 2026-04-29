@@ -759,6 +759,59 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
     console.log("[*] done: " + found + " unique Layout-A objects  (skipped layout=" + skippedLayout + " dup=" + skippedDup + " art=" + skippedArt + ")");
 };
 
+// ── 12c. scan_exact: find exact float64 lat+lon pair, dump raw context ──────────
+// No layout assumptions — shows all rw- hits regardless of surrounding structure.
+// Usage: scan_exact(lat, lon)
+// Example: scan_exact(25.023462, 121.500382)
+global.scan_exact = function(latVal, lonVal) {
+    // serialise latVal to 8 bytes for fast byte-level scanning
+    const tmp = Memory.alloc(8);
+    tmp.writeDouble(latVal);
+    const latBytes = new Uint8Array(tmp.readByteArray(8));
+
+    console.log("[*] scan_exact lat=" + latVal + "  lon=" + lonVal);
+    let found = 0;
+    const artRanges = getArtRanges();
+    const ranges = [];
+    try { Process.enumerateRanges("rw-").forEach(r => ranges.push(r)); } catch(_) {}
+
+    for (const r of ranges) {
+        if (r.size < 8 || r.size > 200*1024*1024) continue;
+        if (isArtAddress(r.base)) continue;
+        let data;
+        try { data = r.base.readByteArray(r.size); } catch(_) { continue; }
+        const arr = new Uint8Array(data);
+        const dv  = new DataView(data);
+        const n   = arr.length;
+
+        for (let i = 0; i <= n - 8; i++) {
+            if (arr[i] !== latBytes[0] || arr[i+1] !== latBytes[1]) continue;
+            let match = true;
+            for (let k = 2; k < 8; k++) if (arr[i+k] !== latBytes[k]) { match = false; break; }
+            if (!match) continue;
+
+            // look for lon within ±64 bytes (8-byte aligned)
+            let lonDelta = 0, lonFound = false;
+            for (let d = -64; d <= 64; d += 8) {
+                const j = i + d;
+                if (j < 0 || j + 8 > n || d === 0) continue;
+                const v = dv.getFloat64(j, true);
+                if (Math.abs(v - lonVal) < 1e-6) { lonDelta = d; lonFound = true; break; }
+            }
+            if (!lonFound) continue;
+
+            const addr = r.base.add(i);
+            console.log("HIT @ " + addr + "  lon at lat" + (lonDelta >= 0 ? "+" : "") + lonDelta);
+            const ctxOff = Math.max(0, i - 64);
+            const ctxLen = Math.min(160, n - ctxOff);
+            console.log(hexBlock(new Uint8Array(data, ctxOff, ctxLen), ctxOff - i));
+            console.log("");
+            if (++found >= 20) { console.log("(capped at 20)"); return; }
+        }
+    }
+    console.log("[*] done: " + found + " hits");
+};
+
 // ── 12b. read_obj: read fields from a known OBJ address (lat field address) ──
 // Usage: read_obj("0x...")
 // Dumps the crystal flag at [+40] and the per-instance data ptr at [+56].
@@ -845,9 +898,10 @@ rpc.exports = {
     scanMushroomObjects:  function() { scan_mushroom_objects(); },
     dumpAt:               function(addr, before, after) { dump_at(addr, before, after); },
     readObj:              function(addr) { read_obj(addr); },
+    scanExact:            function(lat, lon) { scan_exact(lat, lon); },
     evalJs:               function(code) { return eval(code); },
 };
 
 console.log("[*] All hooks loaded. Waiting for rpc2...");
-console.log("[*] REPL: scan_mushroom_objects(cap,lat,latR,lon,lonR) | read_obj(addr) | dump_at(addr) | scan_mushroom_records() | scan_int7()");
+console.log("[*] REPL: scan_mushroom_objects(cap,lat,latR,lon,lonR) | scan_exact(lat,lon) | read_obj(addr) | dump_at(addr)");
 console.log("[*] Flags: trackMalloc (50KB-1MB large bufs) | trackSmall (1KB-50KB coord bufs)");
