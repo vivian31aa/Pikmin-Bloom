@@ -654,25 +654,28 @@ function hexBlock(data, base_rel) {
     return lines.join("\n");
 }
 
-// ── 12. scan_mushroom_objects: rw- only, float64 lat/lon + int32 type in [1,20] ──
+// ── 12. scan_mushroom_objects: rw- only, Layout-A IL2CPP objects, de-duped by [+56] ──
+// Layout A pattern (confirmed mushroom C# instances):
+//   [-16]=null (monitor)  [-8]=ptr (shared config)
+//   [+16]=null  [+24]=ptr (class meta, shared)  [+32]=null  [+40]=int32 1/2/4  [+56]=ptr (per-instance)
+// Only unique [+56] values are shown — eliminates render/cache copies of same instance.
+//
 // Usage: scan_mushroom_objects(cap, latCenter, latRadius, lonCenter, lonRadius)
-//   cap       – max results (default 50)
-//   latCenter – filter to within ±latRadius of this lat (optional)
-//   latRadius – default 0.002 (~200m)
-//   lonCenter – filter to within ±lonRadius of this lon (optional)
-//   lonRadius – default 0.002
-// Example: scan_mushroom_objects(20, 25.0340, 0.001, 121.5640, 0.001)
+//   latRadius/lonRadius default 0.002; pass 0 for exact match
+// Example: scan_mushroom_objects(20, 25.034, 0.001, 121.564, 0.001)
 global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lonRadius) {
     cap = cap || 50;
-    latRadius = latRadius || 0.002;
-    lonRadius = lonRadius || 0.002;
+    // allow exact-0 radius
+    latRadius = (latRadius === undefined || latRadius === null) ? 0.002 : latRadius;
+    lonRadius = (lonRadius === undefined || lonRadius === null) ? 0.002 : lonRadius;
     const filterCoord = (latCenter !== undefined && lonCenter !== undefined);
     if (filterCoord)
         console.log("[*] scan_mushroom_objects — lat " + latCenter + " ±" + latRadius +
-                    "  lon " + lonCenter + " ±" + lonRadius);
+                    "  lon " + lonCenter + " ±" + lonRadius + "  (Layout-A, de-duped)");
     else
-        console.log("[*] scan_mushroom_objects (rw-, float64, excl. ART)...");
-    let found = 0, skippedArt = 0;
+        console.log("[*] scan_mushroom_objects (rw-, Layout-A, de-duped)...");
+    let found = 0, skippedArt = 0, skippedLayout = 0, skippedDup = 0;
+    const seenInst = new Set();   // de-dup by [+56] ptr value
     const ranges = [];
     try { Process.enumerateRanges("rw-").forEach(r => ranges.push(r)); } catch(_) {}
 
@@ -701,45 +704,59 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             if (lonOff < 0) continue;
             if (filterCoord && Math.abs(lon - lonCenter) > lonRadius) continue;
 
-            const searchStart = Math.max(0, Math.min(i, lonOff) - 48);
-            const searchEnd   = Math.min(n - 4, Math.max(i, lonOff) + 56);
-            const typeInts    = [];
-            for (let k = searchStart; k <= searchEnd; k += 4) {
-                if ((k >= i && k < i + 8) || (k >= lonOff && k < lonOff + 8)) continue;
-                let sv;
-                try { sv = dv.getInt32(k, true); } catch(_) { continue; }
-                if (sv >= 1 && sv <= 20) typeInts.push({ rel: k - i, val: sv });
-            }
-            if (typeInts.length === 0) continue;
+            // ── Layout A structural check ──────────────────────────────────────
+            // Only consider objects where lat is at the expected field position,
+            // not a copy embedded in some other struct.
+            // Requires: [+16]=null, [+32]=null, [+24]=valid ptr, [+40]=small int, [+56]=valid ptr
+            if (i + 64 > n || i < 8) { skippedLayout++; continue; }
+            // [+16] must be null
+            if (dv.getFloat64(i + 16, true) !== 0) { skippedLayout++; continue; }
+            // [+32] must be null
+            if (dv.getFloat64(i + 32, true) !== 0) { skippedLayout++; continue; }
+            // [+24] must look like a pointer (high byte 0x70-0x75 for typical Android heap)
+            const ptr24hi = dv.getUint32(i + 28, true);  // high 4 bytes of [+24]
+            if (ptr24hi < 0x70 || ptr24hi > 0x7f) { skippedLayout++; continue; }
+            // [+40] must be int32 in [1,20] with upper 4 bytes = 0
+            const flag = dv.getInt32(i + 40, true);
+            const flagHi = dv.getUint32(i + 44, true);
+            if (flag < 1 || flag > 20 || flagHi !== 0) { skippedLayout++; continue; }
+            // [+56] must look like a pointer
+            const ptr56hi = dv.getUint32(i + 60, true);
+            if (ptr56hi < 0x70 || ptr56hi > 0x7f) { skippedLayout++; continue; }
 
             const objAddr = r.base.add(i);
 
-            // Read per-instance ptr at [+56] — varies per object, holds color/size
+            // De-duplicate: skip if we've already seen this [+56] per-instance ptr
+            const instPtrLo = dv.getUint32(i + 56, true);
+            const instPtrHi = dv.getUint32(i + 60, true);
+            const instKey = instPtrHi.toString(16) + "_" + instPtrLo.toString(16);
+            if (seenInst.has(instKey)) { skippedDup++; continue; }
+            seenInst.add(instKey);
+
+            // Read inst data (first two int32s)
             let instInfo = "";
             try {
                 const instPtr = objAddr.add(56).readPointer();
-                if (!instPtr.isNull()) {
-                    instInfo = "  inst=" + instPtr;
-                    // read first two int32s from instance data
-                    const a = instPtr.readS32(), b = instPtr.add(4).readS32();
-                    if (a >= 1 && a <= 20 && b >= 1 && b <= 20)
-                        instInfo += "  {" + a + "," + b + "}";
-                }
+                instInfo = "  inst=" + instPtr;
+                const a = instPtr.readS32(), b = instPtr.add(4).readS32();
+                if (a >= 1 && a <= 20 && b >= 1 && b <= 20)
+                    instInfo += "  {" + a + "," + b + "}";
             } catch(_) {}
 
-            const typeStr = typeInts.map(t => "[" + (t.rel >= 0 ? "+" : "") + t.rel + "]=" + t.val).join("  ");
-            console.log("OBJ @ " + objAddr + "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
-                        "  " + typeStr + instInfo);
-            const ctxOff = Math.max(0, i - 64);
-            const ctxLen = Math.min(144, n - ctxOff);
-            console.log(hexBlock(new Uint8Array(data, ctxOff, ctxLen), ctxOff - i));
-            console.log("");
+            const flagLabel = flag === 4 ? " (crystal)" : flag === 2 ? " (large?)" : flag === 1 ? " (normal)" : "";
+            console.log("OBJ @ " + objAddr +
+                        "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
+                        "  [+40]=" + flag + flagLabel + instInfo);
 
             found++;
-            if (found >= cap) { console.log("(capped at " + cap + ")"); return; }
+            if (found >= cap) {
+                console.log("(capped at " + cap + ")");
+                console.log("[*] skipped: layout=" + skippedLayout + " dup=" + skippedDup + " art=" + skippedArt);
+                return;
+            }
         }
     }
-    console.log("[*] done: " + found + " objects  (" + skippedArt + " ART ranges skipped)");
+    console.log("[*] done: " + found + " unique Layout-A objects  (skipped layout=" + skippedLayout + " dup=" + skippedDup + " art=" + skippedArt + ")");
 };
 
 // ── 12b. read_obj: read fields from a known OBJ address (lat field address) ──
