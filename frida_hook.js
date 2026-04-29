@@ -25,16 +25,23 @@ function getArtRanges() {
     if (_artRanges) return _artRanges;
     _artRanges = [];
     try {
-        const maps = require("fs").readFileSync("/proc/self/maps", "utf8");
-        for (const line of maps.split("\n")) {
-            // Match dalvik-main space, dalvik-large object space, .art files, etc.
-            if (!line.includes("dalvik-") && !line.includes(".art ") &&
-                !line.includes("jit-code-cache") && !line.includes("indirect ref")) continue;
-            const m = line.match(/^([0-9a-f]+)-([0-9a-f]+)/);
-            if (!m) continue;
-            _artRanges.push({ base: ptr(m[1]), end: ptr(m[2]) });
+        const fopen  = new NativeFunction(Module.findExportByName("libc.so", "fopen"),  'pointer', ['pointer', 'pointer']);
+        const fgets  = new NativeFunction(Module.findExportByName("libc.so", "fgets"),  'pointer', ['pointer', 'int', 'pointer']);
+        const fclose = new NativeFunction(Module.findExportByName("libc.so", "fclose"), 'int',     ['pointer']);
+        const f = fopen(Memory.allocUtf8String("/proc/self/maps"), Memory.allocUtf8String("r"));
+        if (!f.isNull()) {
+            const buf = Memory.alloc(512);
+            while (true) {
+                if (fgets(buf, 512, f).isNull()) break;
+                const line = buf.readUtf8String();
+                if (!line.includes("dalvik") && !line.includes(".art") &&
+                    !line.includes("jit-code-cache") && !line.includes("indirect ref")) continue;
+                const m = line.match(/^([0-9a-f]+)-([0-9a-f]+)/);
+                if (m) _artRanges.push({ base: ptr("0x" + m[1]), end: ptr("0x" + m[2]) });
+            }
+            fclose(f);
         }
-    } catch(_) {}
+    } catch(e) { console.log("[-] getArtRanges: " + e); }
     console.log("[*] ART exclusion ranges loaded: " + _artRanges.length);
     return _artRanges;
 }
@@ -59,7 +66,7 @@ function asciiDensity(arr, off, len) {
     return cnt / len;
 }
 
-
+function hexOf(arr, n) {
     n = Math.min(n || 32, arr.length);
     let s = "";
     for (let i = 0; i < n; i++) s += ("0" + (arr[i] & 0xff).toString(16)).slice(-2) + " ";
