@@ -643,16 +643,80 @@ global.scan_mushroom_records = function(cap) {
                 " (skipped: " + skippedArt + " ART, " + skippedAscii + " string-table)");
 };
 
+// ── 12. scan_mushroom_objects: rw- only, float64 lat/lon + int32 type in [1,20] ──
+// Unity IL2CPP C# objects store coordinates as float64 (double), not int32×1e7.
+// Game state objects are always writable → skip r-- pages entirely.
+global.scan_mushroom_objects = function(cap) {
+    cap = cap || 50;
+    console.log("[*] scan_mushroom_objects: rw- float64 lat/lon + int32 type∈[1,20] (excl. ART)...");
+    let found = 0, skippedArt = 0;
+    const ranges = [];
+    try { Process.enumerateRanges("rw-").forEach(r => ranges.push(r)); } catch(_) {}
+
+    for (const r of ranges) {
+        if (r.size < 24 || r.size > 200*1024*1024) continue;
+        if (isArtAddress(r.base)) { skippedArt++; continue; }
+        let data;
+        try { data = r.base.readByteArray(r.size); } catch(_) { continue; }
+        const dv = new DataView(data);
+        const n = data.byteLength;
+
+        for (let i = 0; i <= n - 16; i += 8) {
+            let lat;
+            try { lat = dv.getFloat64(i, true); } catch(_) { continue; }
+            if (!isFinite(lat) || lat < 20.0 || lat > 27.0) continue;
+
+            // Try each delta for lon (±8, ±16, ±24)
+            let lonOff = -1, lon = 0;
+            for (const delta of [8, 16, -8, -16, 24, -24]) {
+                const j = i + delta;
+                if (j < 0 || j + 8 > n) continue;
+                let v;
+                try { v = dv.getFloat64(j, true); } catch(_) { continue; }
+                if (isFinite(v) && v >= 118.0 && v <= 126.0) { lon = v; lonOff = j; break; }
+            }
+            if (lonOff < 0) continue;
+
+            // Search ±48 bytes around the coord pair for int32 in [1,20] (type/size)
+            const searchStart = Math.max(0, Math.min(i, lonOff) - 48);
+            const searchEnd   = Math.min(n - 4, Math.max(i, lonOff) + 56);
+            const typeInts    = [];
+            for (let k = searchStart; k <= searchEnd; k += 4) {
+                // skip bytes occupied by lat or lon doubles
+                if ((k >= i && k < i + 8) || (k >= lonOff && k < lonOff + 8)) continue;
+                let sv;
+                try { sv = dv.getInt32(k, true); } catch(_) { continue; }
+                if (sv >= 1 && sv <= 20) typeInts.push({ rel: k - i, val: sv });
+            }
+            if (typeInts.length === 0) continue;
+
+            console.log("  OBJ @ " + r.base.add(i) +
+                        " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6));
+            for (const t of typeInts)
+                console.log("    int[" + (t.rel >= 0 ? "+" : "") + t.rel + "] = " + t.val);
+            const ctxOff = Math.max(0, Math.min(i, lonOff) - 32);
+            const ctxLen = Math.min(96, n - ctxOff);
+            console.log("    ctx: " + hexOf(new Uint8Array(data, ctxOff, ctxLen), 64));
+
+            found++;
+            if (found >= cap) { console.log("  (capped at " + cap + ")"); return; }
+        }
+    }
+    console.log("[*] scan_mushroom_objects done: " + found +
+                " candidates (skipped " + skippedArt + " ART ranges)");
+};
+
 // Expose functions to Python via rpc.exports
 rpc.exports = {
-    scanFb:              function() { scan_fb(); },
-    scanPlaintext:       function(minSize) { scan_plaintext(minSize); },
-    scanCoords:          function() { scan_coords(); },
-    scanInt7:            function() { scan_int7(); },
-    scanMushroomRecords: function() { scan_mushroom_records(); },
-    evalJs:              function(code) { return eval(code); },
+    scanFb:               function() { scan_fb(); },
+    scanPlaintext:        function(minSize) { scan_plaintext(minSize); },
+    scanCoords:           function() { scan_coords(); },
+    scanInt7:             function() { scan_int7(); },
+    scanMushroomRecords:  function() { scan_mushroom_records(); },
+    scanMushroomObjects:  function() { scan_mushroom_objects(); },
+    evalJs:               function(code) { return eval(code); },
 };
 
 console.log("[*] All hooks loaded. Waiting for rpc2...");
-console.log("[*] REPL: scan_coords() | scan_int7() | scan_mushroom_records() | scan_fb() | scan_plaintext() | eval(<js>)");
+console.log("[*] REPL: scan_mushroom_objects() | scan_mushroom_records() | scan_int7() | scan_coords() | scan_fb() | scan_plaintext()");
 console.log("[*] Flags: trackMalloc (50KB-1MB large bufs) | trackSmall (1KB-50KB coord bufs)");
