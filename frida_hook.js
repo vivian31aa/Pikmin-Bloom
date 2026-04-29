@@ -772,10 +772,10 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                     const typeKlass = instPtr.readPointer();   // inst[+0] = klass ptr = mushroom type ID
                     instInfo = "  type=" + typeKlass;
                 } catch(_) {}
-                // Scan [+64..+128] for small int32s (candidate size field, not pointer, not zero)
-                if (i + 136 <= n) {
+                // Scan [+64..+160] for small int32s (size/crystal field candidates)
+                if (i + 168 <= n) {
                     const extras = [];
-                    for (let off = 64; off <= 128; off += 8) {
+                    for (let off = 64; off <= 160; off += 8) {
                         const lo = dv.getInt32(i + off, true);
                         const hi = dv.getInt32(i + off + 4, true);
                         if (lo >= 1 && lo <= 10 && hi === 0) extras.push("[+" + off + "]=" + lo);
@@ -785,8 +785,14 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                 }
             }
 
-            const flagLabel = typeStr === "C" ? ""
-                            : flag === 4 ? " (crystal)" : flag === 2 ? " (large?)" : flag === 1 ? " (normal)" : "";
+            const sizeLabel = (sz) => sz === 1 ? "small" : sz === 2 ? "normal" : sz === 3 ? "large" : ("size=" + sz);
+            const crystalLabel = (a) => a === 4 ? "crystal" : "normal";
+            let flagLabel;
+            if (typeStr === "C") {
+                flagLabel = "  (" + crystalLabel(pair48a) + " " + sizeLabel(pair48b) + ")";
+            } else {
+                flagLabel = flag === 4 ? " (crystal)" : flag === 1 ? " (normal)" : (" (flag=" + flag + ")");
+            }
             console.log("OBJ[" + typeStr + "] @ " + objAddr +
                         "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
                         "  [+" + flagOff + "]=" + flag + flagLabel + instInfo);
