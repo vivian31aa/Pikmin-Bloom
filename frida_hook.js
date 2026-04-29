@@ -655,9 +655,23 @@ function hexBlock(data, base_rel) {
 }
 
 // ── 12. scan_mushroom_objects: rw- only, float64 lat/lon + int32 type in [1,20] ──
-global.scan_mushroom_objects = function(cap) {
+// Usage: scan_mushroom_objects(cap, latCenter, latRadius, lonCenter, lonRadius)
+//   cap       – max results (default 50)
+//   latCenter – filter to within ±latRadius of this lat (optional)
+//   latRadius – default 0.002 (~200m)
+//   lonCenter – filter to within ±lonRadius of this lon (optional)
+//   lonRadius – default 0.002
+// Example: scan_mushroom_objects(20, 25.0340, 0.001, 121.5640, 0.001)
+global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lonRadius) {
     cap = cap || 50;
-    console.log("[*] scan_mushroom_objects (rw-, float64, excl. ART)...");
+    latRadius = latRadius || 0.002;
+    lonRadius = lonRadius || 0.002;
+    const filterCoord = (latCenter !== undefined && lonCenter !== undefined);
+    if (filterCoord)
+        console.log("[*] scan_mushroom_objects — lat " + latCenter + " ±" + latRadius +
+                    "  lon " + lonCenter + " ±" + lonRadius);
+    else
+        console.log("[*] scan_mushroom_objects (rw-, float64, excl. ART)...");
     let found = 0, skippedArt = 0;
     const ranges = [];
     try { Process.enumerateRanges("rw-").forEach(r => ranges.push(r)); } catch(_) {}
@@ -674,6 +688,7 @@ global.scan_mushroom_objects = function(cap) {
             let lat;
             try { lat = dv.getFloat64(i, true); } catch(_) { continue; }
             if (!isFinite(lat) || lat < 20.0 || lat > 27.0) continue;
+            if (filterCoord && Math.abs(lat - latCenter) > latRadius) continue;
 
             let lonOff = -1, lon = 0;
             for (const delta of [8, 16, -8, -16, 24, -24]) {
@@ -684,6 +699,7 @@ global.scan_mushroom_objects = function(cap) {
                 if (isFinite(v) && v >= 118.0 && v <= 126.0) { lon = v; lonOff = j; break; }
             }
             if (lonOff < 0) continue;
+            if (filterCoord && Math.abs(lon - lonCenter) > lonRadius) continue;
 
             const searchStart = Math.max(0, Math.min(i, lonOff) - 48);
             const searchEnd   = Math.min(n - 4, Math.max(i, lonOff) + 56);
@@ -696,8 +712,22 @@ global.scan_mushroom_objects = function(cap) {
             }
             if (typeInts.length === 0) continue;
 
+            // Try to read type/size from per-obj data ptr at lat+24
+            const objAddr = r.base.add(i);
+            let typeInfo = "";
+            try {
+                const dataPtr = objAddr.add(24).readPointer();
+                if (!dataPtr.isNull()) {
+                    const t = dataPtr.readS32();
+                    const s = dataPtr.add(4).readS32();
+                    if (t >= 1 && t <= 20 && s >= 1 && s <= 10)
+                        typeInfo = "  type=" + t + " size=" + s;
+                }
+            } catch(_) {}
+
             const typeStr = typeInts.map(t => "[" + (t.rel >= 0 ? "+" : "") + t.rel + "]=" + t.val).join("  ");
-            console.log("OBJ @ " + r.base.add(i) + "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) + "  " + typeStr);
+            console.log("OBJ @ " + objAddr + "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
+                        "  " + typeStr + typeInfo);
             const ctxOff = Math.max(0, i - 64);
             const ctxLen = Math.min(144, n - ctxOff);
             console.log(hexBlock(new Uint8Array(data, ctxOff, ctxLen), ctxOff - i));
@@ -708,6 +738,45 @@ global.scan_mushroom_objects = function(cap) {
         }
     }
     console.log("[*] done: " + found + " objects  (" + skippedArt + " ART ranges skipped)");
+};
+
+// ── 12b. read_obj: read type/size from a known OBJ address (lat field address) ──
+// Usage: read_obj("0x...")
+// Reads per-obj data ptr at addr+24, prints {type, size} and nearby int32s.
+global.read_obj = function(addrStr) {
+    const objAddr = ptr(addrStr);
+    let lat, lon;
+    try { lat = objAddr.readDouble(); } catch(e) { console.log("[-] bad address: " + e); return; }
+    try { lon = objAddr.add(8).readDouble(); } catch(_) { lon = NaN; }
+    console.log("OBJ @ " + addrStr + "  lat=" + lat.toFixed(6) + "  lon=" + (isFinite(lon) ? lon.toFixed(6) : "?"));
+
+    // per-obj data ptr at +24
+    try {
+        const dataPtr = objAddr.add(24).readPointer();
+        if (dataPtr.isNull()) {
+            console.log("  [+24] data ptr = NULL");
+        } else {
+            console.log("  [+24] data ptr = " + dataPtr);
+            const t = dataPtr.readS32();
+            const s = dataPtr.add(4).readS32();
+            console.log("  data[+0] type=" + t + "  data[+4] size=" + s);
+            // dump first 32 bytes of data block
+            const raw = new Uint8Array(dataPtr.readByteArray(32));
+            const dv2 = new DataView(raw.buffer);
+            const pairs = [];
+            for (let k = 0; k + 8 <= 32; k += 8) {
+                const a = dv2.getInt32(k, true), b = dv2.getInt32(k + 4, true);
+                pairs.push("[+" + k + "]={" + a + "," + b + "}");
+            }
+            console.log("  data: " + pairs.join("  "));
+        }
+    } catch(e) { console.log("  [+24] read ptr failed: " + e); }
+
+    // int32 at +40 (crystal flag)
+    try {
+        const v = objAddr.add(40).readS32();
+        console.log("  [+40] int32=" + v + (v === 4 ? "  ← crystal" : v === 1 ? "  ← normal" : ""));
+    } catch(_) {}
 };
 
 // ── 13. dump_at: hexdump + int32 parse around a known address ───────────────────
@@ -751,9 +820,10 @@ rpc.exports = {
     scanMushroomRecords:  function() { scan_mushroom_records(); },
     scanMushroomObjects:  function() { scan_mushroom_objects(); },
     dumpAt:               function(addr, before, after) { dump_at(addr, before, after); },
+    readObj:              function(addr) { read_obj(addr); },
     evalJs:               function(code) { return eval(code); },
 };
 
 console.log("[*] All hooks loaded. Waiting for rpc2...");
-console.log("[*] REPL: scan_mushroom_objects() | scan_mushroom_records() | scan_int7() | scan_coords() | scan_fb() | scan_plaintext()");
+console.log("[*] REPL: scan_mushroom_objects(cap,lat,latR,lon,lonR) | read_obj(addr) | dump_at(addr) | scan_mushroom_records() | scan_int7()");
 console.log("[*] Flags: trackMalloc (50KB-1MB large bufs) | trackSmall (1KB-50KB coord bufs)");
