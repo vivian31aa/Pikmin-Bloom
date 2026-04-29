@@ -705,10 +705,10 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             if (filterCoord && Math.abs(lon - lonCenter) > lonRadius) continue;
 
             // ── IL2CPP mushroom object structural check ────────────────────────
-            // Two confirmed layouts (different C# classes, flag at different offset):
-            //   Type-A: [+16]=null, [+24]=class-ptr, [+32]=null, [+40]=flag, [+56]=inst-ptr
-            //   Type-B: [+16]=null, [+24]=null,      [+32]=flag, [+40]=null, [+56]=inst-ptr
-            // Both require [+16]=null and [+56]=heap ptr.
+            // Three confirmed layouts (heap ptr range 0x60-0x7f on this device):
+            //   Type-A: [+16]=null, [+24]=class-ptr, [+32]=null, [+40]=flag∈[1,20], [+56]=inst-ptr
+            //   Type-B: [+16]=null, [+24]=null,      [+32]=flag∈[1,20], [+40]=null, [+56]=inst-ptr
+            //   Type-C: [+16]=null, [+24]=heap-ptr,  [+32]=null, [+40]=heap-ptr, [+48]={A,B} A,B∈[1,20]
             if (i + 64 > n || i < 8) { skippedLayout++; continue; }
             if (dv.getFloat64(i + 16, true) !== 0) { skippedLayout++; continue; }
 
@@ -717,43 +717,61 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             const flag32    = dv.getInt32(i + 32, true);
             const flag32hi  = dv.getUint32(i + 36, true);
             const ptr24hi   = dv.getUint32(i + 28, true);
+            const ptr40hi   = dv.getUint32(i + 44, true);   // high 4B of [+40]
             const ptr56hi   = dv.getUint32(i + 60, true);
+            const pair48a   = dv.getInt32(i + 48, true);
+            const pair48b   = dv.getInt32(i + 52, true);
+            const pair48ahi = dv.getUint32(i + 52, true);   // high 4B of pair48a slot
+            const pair48bhi = dv.getUint32(i + 60, true);   // high 4B of pair48b slot
 
-            // [+56] must be a heap pointer (0x70-0x7f range on this device)
-            if (ptr56hi < 0x70 || ptr56hi > 0x7f) { skippedLayout++; continue; }
+            // heap pointer check: high 4 bytes in [0x60, 0x7f]
+            const isHeapPtr = (hi) => hi >= 0x60 && hi <= 0x7f;
 
-            let flag, flagOff;
-            if (flag40 >= 1 && flag40 <= 20 && flag40hi === 0 &&
-                ptr24hi >= 0x70 && ptr24hi <= 0x7f) {
-                // Type-A: flag at [+40], class ptr at [+24]
+            let flag, flagOff, typeStr, dedupKey;
+            if (flag40 >= 1 && flag40 <= 20 && flag40hi === 0 && isHeapPtr(ptr24hi) && isHeapPtr(ptr56hi)) {
+                // Type-A: flag at [+40]
                 flag = flag40; flagOff = 40;
+                typeStr = "A";
+                dedupKey = ptr56hi.toString(16) + "_" + dv.getUint32(i + 56, true).toString(16);
             } else if (flag32 >= 1 && flag32 <= 20 && flag32hi === 0 &&
-                       flag40 === 0 && flag40hi === 0) {
-                // Type-B: flag at [+32], [+40]=null (confirmed from Big Red mushroom)
+                       flag40 === 0 && flag40hi === 0 && isHeapPtr(ptr56hi)) {
+                // Type-B: flag at [+32], [+40]=null
                 flag = flag32; flagOff = 32;
+                typeStr = "B";
+                dedupKey = ptr56hi.toString(16) + "_" + dv.getUint32(i + 56, true).toString(16);
+            } else if (isHeapPtr(ptr24hi) && isHeapPtr(ptr40hi) &&
+                       dv.getFloat64(i + 32, true) === 0 &&
+                       pair48a >= 1 && pair48a <= 20 && pair48ahi === 0 &&
+                       pair48b >= 1 && pair48b <= 20 && pair48bhi === 0) {
+                // Type-C: {type,size} at [+48], heap ptrs at [+24] and [+40]
+                flag = pair48a; flagOff = 48;
+                typeStr = "C";
+                dedupKey = ptr40hi.toString(16) + "_" + flag40.toString(16);  // [+40] as dedup key
             } else { skippedLayout++; continue; }
 
             const objAddr = r.base.add(i);
 
-            // De-duplicate: skip if we've already seen this [+56] per-instance ptr
-            const instPtrLo = dv.getUint32(i + 56, true);
-            const instPtrHi = dv.getUint32(i + 60, true);
-            const instKey = instPtrHi.toString(16) + "_" + instPtrLo.toString(16);
-            if (seenInst.has(instKey)) { skippedDup++; continue; }
-            seenInst.add(instKey);
+            // De-duplicate by unique instance ptr
+            if (seenInst.has(dedupKey)) { skippedDup++; continue; }
+            seenInst.add(dedupKey);
 
-            // Read inst data (first two int32s)
+            // For Type-C: {A,B} already in flag/pair48b; for A/B: read inst ptr
             let instInfo = "";
-            try {
-                const instPtr = objAddr.add(56).readPointer();
-                instInfo = "  inst=" + instPtr;
-                const a = instPtr.readS32(), b = instPtr.add(4).readS32();
-                if (a >= 1 && a <= 20 && b >= 1 && b <= 20)
-                    instInfo += "  {" + a + "," + b + "}";
-            } catch(_) {}
+            if (typeStr === "C") {
+                instInfo = "  {" + pair48a + "," + pair48b + "}";
+            } else {
+                try {
+                    const instPtr = objAddr.add(56).readPointer();
+                    instInfo = "  inst=" + instPtr;
+                    const a = instPtr.readS32(), b = instPtr.add(4).readS32();
+                    if (a >= 1 && a <= 20 && b >= 1 && b <= 20)
+                        instInfo += "  {" + a + "," + b + "}";
+                } catch(_) {}
+            }
 
-            const flagLabel = flag === 4 ? " (crystal)" : flag === 2 ? " (large?)" : flag === 1 ? " (normal)" : "";
-            console.log("OBJ @ " + objAddr +
+            const flagLabel = typeStr === "C" ? ""
+                            : flag === 4 ? " (crystal)" : flag === 2 ? " (large?)" : flag === 1 ? " (normal)" : "";
+            console.log("OBJ[" + typeStr + "] @ " + objAddr +
                         "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
                         "  [+" + flagOff + "]=" + flag + flagLabel + instInfo);
 
@@ -765,7 +783,7 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             }
         }
     }
-    console.log("[*] done: " + found + " unique Layout-A objects  (skipped layout=" + skippedLayout + " dup=" + skippedDup + " art=" + skippedArt + ")");
+    console.log("[*] done: " + found + " objects  (skipped layout=" + skippedLayout + " dup=" + skippedDup + " art=" + skippedArt + ")");
 };
 
 // ── 12c. scan_exact: find exact float64 lat+lon pair, dump raw context ──────────
