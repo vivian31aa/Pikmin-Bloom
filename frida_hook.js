@@ -755,7 +755,7 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             if (seenInst.has(dedupKey)) { skippedDup++; continue; }
             seenInst.add(dedupKey);
 
-            // For Type-C: {A,B} already in flag/pair48b; for A/B: read type klass from inst[+0]
+            // For Type-C: {A,B} already in flag/pair48b; for A/B: read type klass + scan for size
             let instInfo = "";
             if (typeStr === "C") {
                 instInfo = "  {" + pair48a + "," + pair48b + "}";
@@ -765,6 +765,16 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                     const typeKlass = instPtr.readPointer();   // inst[+0] = klass ptr = mushroom type ID
                     instInfo = "  type=" + typeKlass;
                 } catch(_) {}
+                // Scan [+64..+128] for small int32s (candidate size field, not pointer, not zero)
+                if (i + 136 <= n) {
+                    const extras = [];
+                    for (let off = 64; off <= 128; off += 8) {
+                        const lo = dv.getInt32(i + off, true);
+                        const hi = dv.getUint32(i + off + 4, true);
+                        if (lo >= 1 && lo <= 10 && hi === 0) extras.push("[+" + off + "]=" + lo);
+                    }
+                    if (extras.length) instInfo += "  " + extras.join(" ");
+                }
             }
 
             const flagLabel = typeStr === "C" ? ""
