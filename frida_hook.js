@@ -663,18 +663,21 @@ function hexBlock(data, base_rel) {
 // Usage: scan_mushroom_objects(cap, latCenter, latRadius, lonCenter, lonRadius)
 //   latRadius/lonRadius default 0.002; pass 0 for exact match
 // Example: scan_mushroom_objects(20, 25.034, 0.001, 121.564, 0.001)
-global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lonRadius) {
+global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lonRadius, typeFilter) {
     cap = cap || 50;
     // allow exact-0 radius
     latRadius = (latRadius === undefined || latRadius === null) ? 0.002 : latRadius;
     lonRadius = (lonRadius === undefined || lonRadius === null) ? 0.002 : lonRadius;
+    // typeFilter: "AB" = skip Type-C (useful when Type-C floods the results)
+    const skipC = (typeFilter && typeFilter.toUpperCase().indexOf("C") === -1);
     const filterCoord = (latCenter !== undefined && lonCenter !== undefined);
     if (filterCoord)
         console.log("[*] scan_mushroom_objects — lat " + latCenter + " ±" + latRadius +
-                    "  lon " + lonCenter + " ±" + lonRadius + "  (Layout-A, de-duped)");
+                    "  lon " + lonCenter + " ±" + lonRadius +
+                    (skipC ? "  [AB only]" : "") + "  (Layout-A, de-duped)");
     else
-        console.log("[*] scan_mushroom_objects (rw-, Layout-A, de-duped)...");
-    let found = 0, skippedArt = 0, skippedLayout = 0, skippedDup = 0;
+        console.log("[*] scan_mushroom_objects (rw-, Layout-A, de-duped)" + (skipC ? " [AB only]" : "") + "...");
+    let found = 0, skippedArt = 0, skippedLayout = 0, skippedDup = 0, skippedC = 0;
     const seenInst = new Set();   // de-dup by [+56] ptr value
 
     // dynamic lat/lon pre-filter bounds (supports non-Taiwan coordinates)
@@ -756,6 +759,8 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                 dedupKey = ptr40hi.toString(16) + "_" + flag40.toString(16);
             } else { skippedLayout++; continue; }
 
+            if (skipC && typeStr === "C") { skippedC++; continue; }
+
             const objAddr = r.base.add(i);
 
             // De-duplicate by unique instance ptr
@@ -800,12 +805,12 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             found++;
             if (found >= cap) {
                 console.log("(capped at " + cap + ")");
-                console.log("[*] skipped: layout=" + skippedLayout + " dup=" + skippedDup + " art=" + skippedArt);
+                console.log("[*] skipped: layout=" + skippedLayout + " dup=" + skippedDup + (skippedC ? " C=" + skippedC : ""));
                 return;
             }
         }
     }
-    console.log("[*] done: " + found + " objects  (skipped layout=" + skippedLayout + " dup=" + skippedDup + " art=" + skippedArt + ")");
+    console.log("[*] done: " + found + " objects  (skipped layout=" + skippedLayout + " dup=" + skippedDup + (skippedC ? " C=" + skippedC : "") + ")");
 };
 
 // ── 12c. scan_exact: find exact float64 lat+lon pair, dump raw context ──────────
