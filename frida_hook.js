@@ -663,7 +663,7 @@ function hexBlock(data, base_rel) {
 // Usage: scan_mushroom_objects(cap, latCenter, latRadius, lonCenter, lonRadius)
 //   latRadius/lonRadius default 0.002; pass 0 for exact match
 // Example: scan_mushroom_objects(20, 25.034, 0.001, 121.564, 0.001)
-global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lonRadius, typeFilter) {
+global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lonRadius, typeFilter, _collect) {
     cap = cap || 50;
     // allow exact-0 radius
     latRadius = (latRadius === undefined || latRadius === null) ? 0.002 : latRadius;
@@ -769,7 +769,9 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
 
             // For Type-C: {A,B} already in flag/pair48b; for A/B: read type klass + scan for size
             let instInfo = "";
+            let objSize = 0, objColorId = 0, objCrystal = 1;
             if (typeStr === "C") {
+                objCrystal = pair48a; objSize = pair48b;
                 instInfo = "  {" + pair48a + "," + pair48b + "}";
             } else {
                 try {
@@ -783,8 +785,13 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                     for (let off = 64; off <= 160; off += 8) {
                         const lo = dv.getInt32(i + off, true);
                         const hi = dv.getInt32(i + off + 4, true);
-                        if (lo >= 1 && lo <= 20 && hi === 0) extras.push("[+" + off + "]=" + lo);
-                        else if (lo >= 1 && lo <= 20 && hi >= 1 && hi <= 20) extras.push("[+" + off + "]={" + lo + "," + hi + "}");
+                        if (lo >= 1 && lo <= 20 && hi === 0) {
+                            extras.push("[+" + off + "]=" + lo);
+                        } else if (lo >= 1 && lo <= 20 && hi >= 1 && hi <= 20) {
+                            extras.push("[+" + off + "]={" + lo + "," + hi + "}");
+                            if (off === 144) { objCrystal = lo; objSize = hi; }
+                            if (off === 152) { objColorId = lo; }
+                        }
                     }
                     if (extras.length) instInfo += "  " + extras.join(" ");
                 }
@@ -801,6 +808,12 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             console.log("OBJ[" + typeStr + "] @ " + objAddr +
                         "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
                         "  [+" + flagOff + "]=" + flag + flagLabel + instInfo);
+
+            if (_collect) _collect.push({
+                lat: lat, lon: lon,
+                size: objSize, colorId: objColorId, crystal: objCrystal,
+                type: typeStr, addr: objAddr.toString()
+            });
 
             found++;
             if (found >= cap) {
@@ -942,6 +955,34 @@ global.dump_at = function(addrStr, before, after) {
     }
 };
 
+// ── find_mushrooms: human-friendly filter wrapper ─────────────────────────────
+// Usage: find_mushrooms("large")  /  find_mushrooms("large","red")
+// size: "small"|"normal"|"large"   color: "red"|"yellow"|"pink"|"fire"|"poisonous"|...
+global.find_mushrooms = function(sizeStr, colorStr) {
+    const SIZE_MAP   = {small:1, normal:2, large:3};
+    const COLOR_MAP  = {red:2, yellow:6, pink:9, electric:9, fire:11, poisonous:18, white:18};
+    const targetSize  = sizeStr  ? (SIZE_MAP[sizeStr.toLowerCase()]  || 0) : 0;
+    const targetColor = colorStr ? (COLOR_MAP[colorStr.toLowerCase()] || 0) : 0;
+
+    const results = [];
+    scan_mushroom_objects(500, undefined, undefined, undefined, undefined, "AB", results);
+
+    const filtered = results.filter(function(m) {
+        if (targetSize  && m.size    !== targetSize)  return false;
+        if (targetColor && m.colorId !== targetColor) return false;
+        return true;
+    });
+    const SIZE_LABEL  = {1:"small", 2:"normal", 3:"large"};
+    const COLOR_LABEL = {2:"red", 6:"yellow", 9:"pink/electric", 11:"fire", 18:"poisonous"};
+    filtered.forEach(function(m) {
+        console.log("MUSHROOM  lat=" + m.lat.toFixed(6) + "  lon=" + m.lon.toFixed(6) +
+                    "  size=" + (SIZE_LABEL[m.size] || m.size) +
+                    "  color=" + (COLOR_LABEL[m.colorId] || (m.colorId || "?")) +
+                    (m.crystal === 4 ? " (crystal)" : ""));
+    });
+    console.log("[find_mushrooms] " + filtered.length + " / " + results.length + " shown");
+};
+
 // Expose functions to Python via rpc.exports
 rpc.exports = {
     scanFb:               function() { scan_fb(); },
@@ -954,6 +995,12 @@ rpc.exports = {
     readObj:              function(addr) { read_obj(addr); },
     scanExact:            function(lat, lon) { scan_exact(lat, lon); },
     evalJs:               function(code) { return eval(code); },
+    // Returns JSON array of mushroom objects for the Python scanner
+    scanMushrooms: function(lat, lon, radius) {
+        const results = [];
+        scan_mushroom_objects(500, lat, radius, lon, radius, "AB", results);
+        return JSON.stringify(results);
+    },
 };
 
 console.log("[*] All hooks loaded. Waiting for rpc2...");
