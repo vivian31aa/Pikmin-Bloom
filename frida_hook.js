@@ -676,12 +676,19 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
         console.log("[*] scan_mushroom_objects (rw-, Layout-A, de-duped)...");
     let found = 0, skippedArt = 0, skippedLayout = 0, skippedDup = 0;
     const seenInst = new Set();   // de-dup by [+56] ptr value
+
+    // dynamic lat/lon pre-filter bounds (supports non-Taiwan coordinates)
+    const margin = 0.05;
+    const latMin = filterCoord ? latCenter - Math.max(latRadius, margin) : -90.0;
+    const latMax = filterCoord ? latCenter + Math.max(latRadius, margin) :  90.0;
+    const lonMin = filterCoord ? lonCenter - Math.max(lonRadius, margin) : -180.0;
+    const lonMax = filterCoord ? lonCenter + Math.max(lonRadius, margin) :  180.0;
+
     const ranges = [];
     try { Process.enumerateRanges("rw-").forEach(r => ranges.push(r)); } catch(_) {}
 
     for (const r of ranges) {
         if (r.size < 24 || r.size > 200*1024*1024) continue;
-        if (isArtAddress(r.base)) { skippedArt++; continue; }
         let data;
         try { data = r.base.readByteArray(r.size); } catch(_) { continue; }
         const dv = new DataView(data);
@@ -690,7 +697,7 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
         for (let i = 0; i <= n - 16; i += 8) {
             let lat;
             try { lat = dv.getFloat64(i, true); } catch(_) { continue; }
-            if (!isFinite(lat) || lat < 20.0 || lat > 27.0) continue;
+            if (!isFinite(lat) || lat < latMin || lat > latMax) continue;
             if (filterCoord && Math.abs(lat - latCenter) > latRadius) continue;
 
             let lonOff = -1, lon = 0;
@@ -699,7 +706,7 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                 if (j < 0 || j + 8 > n) continue;
                 let v;
                 try { v = dv.getFloat64(j, true); } catch(_) { continue; }
-                if (isFinite(v) && v >= 118.0 && v <= 126.0) { lon = v; lonOff = j; break; }
+                if (isFinite(v) && v >= lonMin && v <= lonMax) { lon = v; lonOff = j; break; }
             }
             if (lonOff < 0) continue;
             if (filterCoord && Math.abs(lon - lonCenter) > lonRadius) continue;
