@@ -712,22 +712,24 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             }
             if (typeInts.length === 0) continue;
 
-            // Try to read type/size from per-obj data ptr at lat+24
             const objAddr = r.base.add(i);
-            let typeInfo = "";
+
+            // Read per-instance ptr at [+56] — varies per object, holds color/size
+            let instInfo = "";
             try {
-                const dataPtr = objAddr.add(24).readPointer();
-                if (!dataPtr.isNull()) {
-                    const t = dataPtr.readS32();
-                    const s = dataPtr.add(4).readS32();
-                    if (t >= 1 && t <= 20 && s >= 1 && s <= 10)
-                        typeInfo = "  type=" + t + " size=" + s;
+                const instPtr = objAddr.add(56).readPointer();
+                if (!instPtr.isNull()) {
+                    instInfo = "  inst=" + instPtr;
+                    // read first two int32s from instance data
+                    const a = instPtr.readS32(), b = instPtr.add(4).readS32();
+                    if (a >= 1 && a <= 20 && b >= 1 && b <= 20)
+                        instInfo += "  {" + a + "," + b + "}";
                 }
             } catch(_) {}
 
             const typeStr = typeInts.map(t => "[" + (t.rel >= 0 ? "+" : "") + t.rel + "]=" + t.val).join("  ");
             console.log("OBJ @ " + objAddr + "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
-                        "  " + typeStr + typeInfo);
+                        "  " + typeStr + instInfo);
             const ctxOff = Math.max(0, i - 64);
             const ctxLen = Math.min(144, n - ctxOff);
             console.log(hexBlock(new Uint8Array(data, ctxOff, ctxLen), ctxOff - i));
