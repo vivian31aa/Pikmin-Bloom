@@ -694,9 +694,11 @@ global.scan_mushroom_objects = function(cap) {
                         " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6));
             for (const t of typeInts)
                 console.log("    int[" + (t.rel >= 0 ? "+" : "") + t.rel + "] = " + t.val);
-            const ctxOff = Math.max(0, Math.min(i, lonOff) - 32);
-            const ctxLen = Math.min(96, n - ctxOff);
-            console.log("    ctx: " + hexOf(new Uint8Array(data, ctxOff, ctxLen), 64));
+            // Show 128 bytes centred on lat so int[+40..+56] is always visible
+            const ctxOff = Math.max(0, i - 56);
+            const ctxLen = Math.min(128, n - ctxOff);
+            console.log("    ctx[lat-" + (i - ctxOff) + "]: " +
+                        hexOf(new Uint8Array(data, ctxOff, ctxLen), 128));
 
             found++;
             if (found >= cap) { console.log("  (capped at " + cap + ")"); return; }
@@ -704,6 +706,49 @@ global.scan_mushroom_objects = function(cap) {
     }
     console.log("[*] scan_mushroom_objects done: " + found +
                 " candidates (skipped " + skippedArt + " ART ranges)");
+};
+
+// ── 13. dump_at: hexdump + structured parse around a known address ──────────────
+global.dump_at = function(addrStr, before, after) {
+    before = before || 80;
+    after  = after  || 160;
+    const base = ptr(addrStr).sub(before);
+    const len  = before + after;
+    let data;
+    try { data = new Uint8Array(base.readByteArray(len)); }
+    catch(e) { console.log("[-] dump_at read failed: " + e); return; }
+    const dv = new DataView(data.buffer);
+    console.log("[dump_at] " + addrStr + "  before=" + before + " after=" + after);
+    // hex lines
+    for (let off = 0; off < len; off += 16) {
+        const slice = data.slice(off, off + 16);
+        const rel   = off - before;
+        const marker = (rel === 0) ? " ← lat" : "";
+        console.log("  " + (rel >= 0 ? "+" : "") + rel + "\t" + hexOf(slice, 16) + marker);
+    }
+    // structured field parse at 8-byte strides (pointers / doubles)
+    console.log("[fields @ 8B stride]");
+    for (let off = 0; off + 8 <= len; off += 8) {
+        const rel  = off - before;
+        const f64  = dv.getFloat64(off, true);
+        const u64lo = dv.getUint32(off, true);
+        const u64hi = dv.getUint32(off + 4, true);
+        const isLat = isFinite(f64) && f64 >= 20.0 && f64 <= 27.0;
+        const isLon = isFinite(f64) && f64 >= 118.0 && f64 <= 126.0;
+        const tag   = isLat ? " ← LAT" : isLon ? " ← LON" : "";
+        if (u64hi === 0 && u64lo === 0) continue;  // skip zero-only
+        const ptr64 = "0x" + u64hi.toString(16).padStart(8,"0") + u64lo.toString(16).padStart(8,"0");
+        console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  ptr=" + ptr64 +
+                    "  f64=" + (isFinite(f64) ? f64.toFixed(6) : "NaN") + tag);
+    }
+    // int32 fields at 4-byte strides
+    console.log("[int32 candidates @ 4B stride, non-zero, |val|<500]");
+    for (let off = 0; off + 4 <= len; off += 4) {
+        const rel = off - before;
+        const v   = dv.getInt32(off, true);
+        if (v === 0 || v > 500 || v < -500) continue;
+        console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  int32=" + v);
+    }
 };
 
 // Expose functions to Python via rpc.exports
@@ -714,6 +759,7 @@ rpc.exports = {
     scanInt7:             function() { scan_int7(); },
     scanMushroomRecords:  function() { scan_mushroom_records(); },
     scanMushroomObjects:  function() { scan_mushroom_objects(); },
+    dumpAt:               function(addr, before, after) { dump_at(addr, before, after); },
     evalJs:               function(code) { return eval(code); },
 };
 
