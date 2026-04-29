@@ -740,9 +740,10 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
     console.log("[*] done: " + found + " objects  (" + skippedArt + " ART ranges skipped)");
 };
 
-// ── 12b. read_obj: read type/size from a known OBJ address (lat field address) ──
+// ── 12b. read_obj: read fields from a known OBJ address (lat field address) ──
 // Usage: read_obj("0x...")
-// Reads per-obj data ptr at addr+24, prints {type, size} and nearby int32s.
+// Dumps the crystal flag at [+40] and the per-instance data ptr at [+56].
+// [+24] is class-level metadata shared by all instances; [+56] varies per object.
 global.read_obj = function(addrStr) {
     const objAddr = ptr(addrStr);
     let lat, lon;
@@ -750,33 +751,37 @@ global.read_obj = function(addrStr) {
     try { lon = objAddr.add(8).readDouble(); } catch(_) { lon = NaN; }
     console.log("OBJ @ " + addrStr + "  lat=" + lat.toFixed(6) + "  lon=" + (isFinite(lon) ? lon.toFixed(6) : "?"));
 
-    // per-obj data ptr at +24
-    try {
-        const dataPtr = objAddr.add(24).readPointer();
-        if (dataPtr.isNull()) {
-            console.log("  [+24] data ptr = NULL");
-        } else {
-            console.log("  [+24] data ptr = " + dataPtr);
-            const t = dataPtr.readS32();
-            const s = dataPtr.add(4).readS32();
-            console.log("  data[+0] type=" + t + "  data[+4] size=" + s);
-            // dump first 32 bytes of data block
-            const raw = new Uint8Array(dataPtr.readByteArray(32));
-            const dv2 = new DataView(raw.buffer);
-            const pairs = [];
-            for (let k = 0; k + 8 <= 32; k += 8) {
-                const a = dv2.getInt32(k, true), b = dv2.getInt32(k + 4, true);
-                pairs.push("[+" + k + "]={" + a + "," + b + "}");
-            }
-            console.log("  data: " + pairs.join("  "));
-        }
-    } catch(e) { console.log("  [+24] read ptr failed: " + e); }
+    // [+24]: class-level ptr (shared across all instances of same class)
+    try { console.log("  [+24] class ptr = " + objAddr.add(24).readPointer()); } catch(_) {}
 
-    // int32 at +40 (crystal flag)
+    // [+40]: crystal/size flag
     try {
         const v = objAddr.add(40).readS32();
-        console.log("  [+40] int32=" + v + (v === 4 ? "  ← crystal" : v === 1 ? "  ← normal" : ""));
+        const label = v === 4 ? "  ← crystal" : v === 1 ? "  ← normal/small?" : v === 2 ? "  ← large?" : "";
+        console.log("  [+40] flag=" + v + label);
     } catch(_) {}
+
+    // [+56]: per-instance data ptr (varies per object — likely holds color/size)
+    try {
+        const instPtr = objAddr.add(56).readPointer();
+        if (instPtr.isNull()) {
+            console.log("  [+56] inst ptr = NULL");
+        } else {
+            console.log("  [+56] inst ptr = " + instPtr);
+            const raw = new Uint8Array(instPtr.readByteArray(64));
+            const dv2 = new DataView(raw.buffer);
+            const parts = [];
+            for (let k = 0; k + 8 <= 64; k += 8) {
+                const lo = dv2.getUint32(k, true);
+                const hi = dv2.getUint32(k + 4, true);
+                if (lo === 0 && hi === 0) continue;
+                if (lo > 100000 || hi > 100000) { parts.push("[+" + k + "]=ptr(" + instPtr.add(k) + ")"); continue; }
+                const a = dv2.getInt32(k, true), b = dv2.getInt32(k + 4, true);
+                parts.push(hi === 0 ? "[+" + k + "]=" + a : "[+" + k + "]={" + a + "," + b + "}");
+            }
+            console.log("  inst: " + (parts.length ? parts.join("  ") : "(all zero or pointers)"));
+        }
+    } catch(e) { console.log("  [+56] read ptr failed: " + e); }
 };
 
 // ── 13. dump_at: hexdump + int32 parse around a known address ───────────────────
