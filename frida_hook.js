@@ -704,25 +704,34 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             if (lonOff < 0) continue;
             if (filterCoord && Math.abs(lon - lonCenter) > lonRadius) continue;
 
-            // ── Layout A structural check ──────────────────────────────────────
-            // Only consider objects where lat is at the expected field position,
-            // not a copy embedded in some other struct.
-            // Requires: [+16]=null, [+32]=null, [+24]=valid ptr, [+40]=small int, [+56]=valid ptr
+            // ── IL2CPP mushroom object structural check ────────────────────────
+            // Two confirmed layouts (different C# classes, flag at different offset):
+            //   Type-A: [+16]=null, [+24]=class-ptr, [+32]=null, [+40]=flag, [+56]=inst-ptr
+            //   Type-B: [+16]=null, [+24]=null,      [+32]=flag, [+40]=null, [+56]=inst-ptr
+            // Both require [+16]=null and [+56]=heap ptr.
             if (i + 64 > n || i < 8) { skippedLayout++; continue; }
-            // [+16] must be null
             if (dv.getFloat64(i + 16, true) !== 0) { skippedLayout++; continue; }
-            // [+32] must be null
-            if (dv.getFloat64(i + 32, true) !== 0) { skippedLayout++; continue; }
-            // [+24] must look like a pointer (high byte 0x70-0x75 for typical Android heap)
-            const ptr24hi = dv.getUint32(i + 28, true);  // high 4 bytes of [+24]
-            if (ptr24hi < 0x70 || ptr24hi > 0x7f) { skippedLayout++; continue; }
-            // [+40] must be int32 in [1,20] with upper 4 bytes = 0
-            const flag = dv.getInt32(i + 40, true);
-            const flagHi = dv.getUint32(i + 44, true);
-            if (flag < 1 || flag > 20 || flagHi !== 0) { skippedLayout++; continue; }
-            // [+56] must look like a pointer
-            const ptr56hi = dv.getUint32(i + 60, true);
+
+            const flag40    = dv.getInt32(i + 40, true);
+            const flag40hi  = dv.getUint32(i + 44, true);
+            const flag32    = dv.getInt32(i + 32, true);
+            const flag32hi  = dv.getUint32(i + 36, true);
+            const ptr24hi   = dv.getUint32(i + 28, true);
+            const ptr56hi   = dv.getUint32(i + 60, true);
+
+            // [+56] must be a heap pointer (0x70-0x7f range on this device)
             if (ptr56hi < 0x70 || ptr56hi > 0x7f) { skippedLayout++; continue; }
+
+            let flag, flagOff;
+            if (flag40 >= 1 && flag40 <= 20 && flag40hi === 0 &&
+                ptr24hi >= 0x70 && ptr24hi <= 0x7f) {
+                // Type-A: flag at [+40], class ptr at [+24]
+                flag = flag40; flagOff = 40;
+            } else if (flag32 >= 1 && flag32 <= 20 && flag32hi === 0 &&
+                       flag40 === 0 && flag40hi === 0) {
+                // Type-B: flag at [+32], [+40]=null (confirmed from Big Red mushroom)
+                flag = flag32; flagOff = 32;
+            } else { skippedLayout++; continue; }
 
             const objAddr = r.base.add(i);
 
@@ -746,7 +755,7 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             const flagLabel = flag === 4 ? " (crystal)" : flag === 2 ? " (large?)" : flag === 1 ? " (normal)" : "";
             console.log("OBJ @ " + objAddr +
                         "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) +
-                        "  [+40]=" + flag + flagLabel + instInfo);
+                        "  [+" + flagOff + "]=" + flag + flagLabel + instInfo);
 
             found++;
             if (found >= cap) {
