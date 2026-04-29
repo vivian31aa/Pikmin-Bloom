@@ -722,17 +722,23 @@ global.dump_at = function(addrStr, before, after) {
     const dv = new DataView(data.buffer);
     console.log("dump_at " + addrStr + "  -" + before + " .. +" + after);
     console.log(hexBlock(data, -before));
-    console.log("--- int32 fields (non-zero, |val|≤500, upper 4B = 0) ---");
-    for (let off = 0; off + 4 <= len; off += 4) {
-        const v  = dv.getInt32(off, true);
-        if (v === 0 || v > 500 || v < -500) continue;
-        // skip if the upper 4 bytes of the 8B word are non-zero → it's a pointer
-        if (off + 8 <= len && dv.getUint32(off + 4, true) !== 0) continue;
+    console.log("--- int32 pairs @ 8B stride (non-pointer, non-zero) ---");
+    for (let off = 0; off + 8 <= len; off += 8) {
+        const lo = dv.getUint32(off, true);
+        const hi = dv.getUint32(off + 4, true);
+        if (lo === 0 && hi === 0) continue;
+        if (lo > 100000) continue;        // pointer: low-half is always large
+        if (hi > 100000) continue;        // sanity check on high-half
         const rel = off - before;
         const f64 = dv.getFloat64(off, true);
-        const coord = isFinite(f64) && ((f64 >= 20 && f64 <= 27) || (f64 >= 118 && f64 <= 126))
-                      ? "  f64=" + f64.toFixed(6) : "";
-        console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  " + v + coord);
+        const isCoord = isFinite(f64) && ((f64 >= 20 && f64 <= 27) || (f64 >= 118 && f64 <= 126));
+        const a = dv.getInt32(off, true), b = dv.getInt32(off + 4, true);
+        if (isCoord)
+            console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  f64=" + f64.toFixed(6) + "  ← coord");
+        else if (hi === 0)
+            console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  int32=" + a);
+        else
+            console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  {" + a + ", " + b + "}");
     }
 };
 
