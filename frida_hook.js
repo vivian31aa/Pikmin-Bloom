@@ -719,10 +719,8 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             const ptr24hi   = dv.getUint32(i + 28, true);
             const ptr40hi   = dv.getUint32(i + 44, true);   // high 4B of [+40]
             const ptr56hi   = dv.getUint32(i + 60, true);
-            const pair48a   = dv.getInt32(i + 48, true);
-            const pair48b   = dv.getInt32(i + 52, true);
-            const pair48ahi = dv.getUint32(i + 52, true);   // high 4B of pair48a slot
-            const pair48bhi = dv.getUint32(i + 60, true);   // high 4B of pair48b slot
+            const pair48a   = dv.getInt32(i + 48, true);    // A: int32 at [+48..+51]
+            const pair48b   = dv.getInt32(i + 52, true);    // B: int32 at [+52..+55]
 
             // heap pointer check: high 4 bytes in [0x60, 0x7f]
             const isHeapPtr = (hi) => hi >= 0x60 && hi <= 0x7f;
@@ -741,12 +739,14 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                 dedupKey = ptr56hi.toString(16) + "_" + dv.getUint32(i + 56, true).toString(16);
             } else if (isHeapPtr(ptr24hi) && isHeapPtr(ptr40hi) &&
                        dv.getFloat64(i + 32, true) === 0 &&
-                       pair48a >= 1 && pair48a <= 20 && pair48ahi === 0 &&
-                       pair48b >= 1 && pair48b <= 20 && pair48bhi === 0) {
-                // Type-C: {type,size} at [+48], heap ptrs at [+24] and [+40]
+                       dv.getFloat64(i + 56, true) === 0 &&
+                       pair48a >= 1 && pair48a <= 20 &&
+                       pair48b >= 1 && pair48b <= 20) {
+                // Type-C: {A,B} at [+48], [+56]=null, heap ptrs at [+24] and [+40]
+                // A=crystal(1=normal,4=crystal) B=size(1=small,3=large) — color unknown
                 flag = pair48a; flagOff = 48;
                 typeStr = "C";
-                dedupKey = ptr40hi.toString(16) + "_" + flag40.toString(16);  // [+40] as dedup key
+                dedupKey = ptr40hi.toString(16) + "_" + flag40.toString(16);
             } else { skippedLayout++; continue; }
 
             const objAddr = r.base.add(i);
