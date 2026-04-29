@@ -144,15 +144,12 @@ let rpc2LargeDetected = false;  // flag to trigger auto memory scan
                     rpc2LargeDetected = true;
                     trackMalloc = true;
                     trackSmall  = true;
-                    console.log("[SSL_read] large rpc2 chunk (" + full.length + " bytes) — arming malloc+small tracker, scan_coords in 5s");
+                    console.log("[SSL_read] large rpc2 chunk (" + full.length + " bytes) — malloc/small tracker armed for 5s");
                     setTimeout(function() {
                         trackMalloc = false;
                         trackSmall  = false;
-                        console.log("[auto-scan] running scan_coords + scan_int7 + scan_mushroom_records...");
-                        scan_coords();
-                        scan_int7();
-                        scan_mushroom_records();
                         rpc2LargeDetected = false;
+                        console.log("[SSL_read] tracker disarmed — run scan_mushroom_objects() manually");
                     }, 5000);
                 }
             }
@@ -725,12 +722,14 @@ global.dump_at = function(addrStr, before, after) {
     const dv = new DataView(data.buffer);
     console.log("dump_at " + addrStr + "  -" + before + " .. +" + after);
     console.log(hexBlock(data, -before));
-    console.log("--- int32 (non-zero, |val|≤500) ---");
+    console.log("--- int32 fields (non-zero, |val|≤500, upper 4B = 0) ---");
     for (let off = 0; off + 4 <= len; off += 4) {
-        const v = dv.getInt32(off, true);
+        const v  = dv.getInt32(off, true);
         if (v === 0 || v > 500 || v < -500) continue;
+        // skip if the upper 4 bytes of the 8B word are non-zero → it's a pointer
+        if (off + 8 <= len && dv.getUint32(off + 4, true) !== 0) continue;
         const rel = off - before;
-        const f64 = (off + 8 <= len) ? dv.getFloat64(off, true) : NaN;
+        const f64 = dv.getFloat64(off, true);
         const coord = isFinite(f64) && ((f64 >= 20 && f64 <= 27) || (f64 >= 118 && f64 <= 126))
                       ? "  f64=" + f64.toFixed(6) : "";
         console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  " + v + coord);
