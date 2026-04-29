@@ -755,17 +755,15 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
             if (seenInst.has(dedupKey)) { skippedDup++; continue; }
             seenInst.add(dedupKey);
 
-            // For Type-C: {A,B} already in flag/pair48b; for A/B: read inst ptr
+            // For Type-C: {A,B} already in flag/pair48b; for A/B: read type klass from inst[+0]
             let instInfo = "";
             if (typeStr === "C") {
                 instInfo = "  {" + pair48a + "," + pair48b + "}";
             } else {
                 try {
                     const instPtr = objAddr.add(56).readPointer();
-                    instInfo = "  inst=" + instPtr;
-                    const a = instPtr.readS32(), b = instPtr.add(4).readS32();
-                    if (a >= 1 && a <= 20 && b >= 1 && b <= 20)
-                        instInfo += "  {" + a + "," + b + "}";
+                    const typeKlass = instPtr.readPointer();   // inst[+0] = klass ptr = mushroom type ID
+                    instInfo = "  type=" + typeKlass;
                 } catch(_) {}
             }
 
