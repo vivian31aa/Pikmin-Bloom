@@ -145,6 +145,7 @@ def grid_points(center_lat, center_lon, range_deg, step_deg):
 
 # ── 主程式 ────────────────────────────────────────────────────────────────────
 def main():
+    global LOAD_WAIT_MIN
     parser = argparse.ArgumentParser(description="Pikmin Bloom large mushroom Frida scanner")
     parser.add_argument("--cities", nargs="*", help="城市名稱篩選（空格分隔，預設掃全部）")
     parser.add_argument("--lat",   type=float, help="自訂中心緯度（與 --lon 搭配）")
@@ -155,7 +156,6 @@ def main():
     parser.add_argument("--output", default=str(OUTPUT_FILE))
     args = parser.parse_args()
 
-    global LOAD_WAIT_MIN
     LOAD_WAIT_MIN = args.wait
 
     # 決定掃描目標列表
