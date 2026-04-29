@@ -643,12 +643,24 @@ global.scan_mushroom_records = function(cap) {
                 " (skipped: " + skippedArt + " ART, " + skippedAscii + " string-table)");
 };
 
+// shared: multi-line hexdump, skip all-zero 16B rows, mark relative offsets
+function hexBlock(data, base_rel) {
+    const lines = [];
+    for (let off = 0; off + 16 <= data.length; off += 16) {
+        let allZero = true;
+        for (let k = 0; k < 16; k++) if (data[off + k]) { allZero = false; break; }
+        if (allZero) continue;
+        const rel = base_rel + off;
+        const tag = (rel >= 0 ? "+" : "") + rel;
+        lines.push("  " + tag.padStart(5) + "  " + hexOf(data.slice(off, off + 16), 16));
+    }
+    return lines.join("\n");
+}
+
 // ── 12. scan_mushroom_objects: rw- only, float64 lat/lon + int32 type in [1,20] ──
-// Unity IL2CPP C# objects store coordinates as float64 (double), not int32×1e7.
-// Game state objects are always writable → skip r-- pages entirely.
 global.scan_mushroom_objects = function(cap) {
     cap = cap || 50;
-    console.log("[*] scan_mushroom_objects: rw- float64 lat/lon + int32 type∈[1,20] (excl. ART)...");
+    console.log("[*] scan_mushroom_objects (rw-, float64, excl. ART)...");
     let found = 0, skippedArt = 0;
     const ranges = [];
     try { Process.enumerateRanges("rw-").forEach(r => ranges.push(r)); } catch(_) {}
@@ -666,7 +678,6 @@ global.scan_mushroom_objects = function(cap) {
             try { lat = dv.getFloat64(i, true); } catch(_) { continue; }
             if (!isFinite(lat) || lat < 20.0 || lat > 27.0) continue;
 
-            // Try each delta for lon (±8, ±16, ±24)
             let lonOff = -1, lon = 0;
             for (const delta of [8, 16, -8, -16, 24, -24]) {
                 const j = i + delta;
@@ -677,12 +688,10 @@ global.scan_mushroom_objects = function(cap) {
             }
             if (lonOff < 0) continue;
 
-            // Search ±48 bytes around the coord pair for int32 in [1,20] (type/size)
             const searchStart = Math.max(0, Math.min(i, lonOff) - 48);
             const searchEnd   = Math.min(n - 4, Math.max(i, lonOff) + 56);
             const typeInts    = [];
             for (let k = searchStart; k <= searchEnd; k += 4) {
-                // skip bytes occupied by lat or lon doubles
                 if ((k >= i && k < i + 8) || (k >= lonOff && k < lonOff + 8)) continue;
                 let sv;
                 try { sv = dv.getInt32(k, true); } catch(_) { continue; }
@@ -690,25 +699,21 @@ global.scan_mushroom_objects = function(cap) {
             }
             if (typeInts.length === 0) continue;
 
-            console.log("  OBJ @ " + r.base.add(i) +
-                        " lat=" + lat.toFixed(6) + " lon=" + lon.toFixed(6));
-            for (const t of typeInts)
-                console.log("    int[" + (t.rel >= 0 ? "+" : "") + t.rel + "] = " + t.val);
-            // Show 128 bytes centred on lat so int[+40..+56] is always visible
-            const ctxOff = Math.max(0, i - 56);
-            const ctxLen = Math.min(128, n - ctxOff);
-            console.log("    ctx[lat-" + (i - ctxOff) + "]: " +
-                        hexOf(new Uint8Array(data, ctxOff, ctxLen), 128));
+            const typeStr = typeInts.map(t => "[" + (t.rel >= 0 ? "+" : "") + t.rel + "]=" + t.val).join("  ");
+            console.log("OBJ @ " + r.base.add(i) + "  lat=" + lat.toFixed(6) + "  lon=" + lon.toFixed(6) + "  " + typeStr);
+            const ctxOff = Math.max(0, i - 64);
+            const ctxLen = Math.min(144, n - ctxOff);
+            console.log(hexBlock(new Uint8Array(data, ctxOff, ctxLen), ctxOff - i));
+            console.log("");
 
             found++;
-            if (found >= cap) { console.log("  (capped at " + cap + ")"); return; }
+            if (found >= cap) { console.log("(capped at " + cap + ")"); return; }
         }
     }
-    console.log("[*] scan_mushroom_objects done: " + found +
-                " candidates (skipped " + skippedArt + " ART ranges)");
+    console.log("[*] done: " + found + " objects  (" + skippedArt + " ART ranges skipped)");
 };
 
-// ── 13. dump_at: hexdump + structured parse around a known address ──────────────
+// ── 13. dump_at: hexdump + int32 parse around a known address ───────────────────
 global.dump_at = function(addrStr, before, after) {
     before = before || 80;
     after  = after  || 160;
@@ -716,38 +721,19 @@ global.dump_at = function(addrStr, before, after) {
     const len  = before + after;
     let data;
     try { data = new Uint8Array(base.readByteArray(len)); }
-    catch(e) { console.log("[-] dump_at read failed: " + e); return; }
+    catch(e) { console.log("[-] read failed: " + e); return; }
     const dv = new DataView(data.buffer);
-    console.log("[dump_at] " + addrStr + "  before=" + before + " after=" + after);
-    // hex lines
-    for (let off = 0; off < len; off += 16) {
-        const slice = data.slice(off, off + 16);
-        const rel   = off - before;
-        const marker = (rel === 0) ? " ← lat" : "";
-        console.log("  " + (rel >= 0 ? "+" : "") + rel + "\t" + hexOf(slice, 16) + marker);
-    }
-    // structured field parse at 8-byte strides (pointers / doubles)
-    console.log("[fields @ 8B stride]");
-    for (let off = 0; off + 8 <= len; off += 8) {
-        const rel  = off - before;
-        const f64  = dv.getFloat64(off, true);
-        const u64lo = dv.getUint32(off, true);
-        const u64hi = dv.getUint32(off + 4, true);
-        const isLat = isFinite(f64) && f64 >= 20.0 && f64 <= 27.0;
-        const isLon = isFinite(f64) && f64 >= 118.0 && f64 <= 126.0;
-        const tag   = isLat ? " ← LAT" : isLon ? " ← LON" : "";
-        if (u64hi === 0 && u64lo === 0) continue;  // skip zero-only
-        const ptr64 = "0x" + u64hi.toString(16).padStart(8,"0") + u64lo.toString(16).padStart(8,"0");
-        console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  ptr=" + ptr64 +
-                    "  f64=" + (isFinite(f64) ? f64.toFixed(6) : "NaN") + tag);
-    }
-    // int32 fields at 4-byte strides
-    console.log("[int32 candidates @ 4B stride, non-zero, |val|<500]");
+    console.log("dump_at " + addrStr + "  -" + before + " .. +" + after);
+    console.log(hexBlock(data, -before));
+    console.log("--- int32 (non-zero, |val|≤500) ---");
     for (let off = 0; off + 4 <= len; off += 4) {
-        const rel = off - before;
-        const v   = dv.getInt32(off, true);
+        const v = dv.getInt32(off, true);
         if (v === 0 || v > 500 || v < -500) continue;
-        console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  int32=" + v);
+        const rel = off - before;
+        const f64 = (off + 8 <= len) ? dv.getFloat64(off, true) : NaN;
+        const coord = isFinite(f64) && ((f64 >= 20 && f64 <= 27) || (f64 >= 118 && f64 <= 126))
+                      ? "  f64=" + f64.toFixed(6) : "";
+        console.log("  [" + (rel >= 0 ? "+" : "") + rel + "]  " + v + coord);
     }
 };
 
