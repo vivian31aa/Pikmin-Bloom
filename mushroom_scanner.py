@@ -86,17 +86,44 @@ def set_gps(lat: float, lon: float):
     adb("emu", "geo", "fix", str(lon), str(lat))
 
 # ── Frida 連線 ───────────────────────────────────────────────────────────────
+PIKMIN_PKG = "com.nianticlabs.pikminbloom"
+
 def connect_frida():
     device = frida.get_device_manager().add_remote_device(FRIDA_HOST)
-    # 找 Pikmin Bloom 的 process
-    for app in device.enumerate_applications(scope="full"):
-        if "pikmin" in app.name.lower() or "com.nianticlabs.pikminbloom" in (app.identifier or "").lower():
-            session = device.attach(app.pid)
-            script = session.create_script(FRIDA_SCRIPT.read_text())
-            script.load()
-            print(f"[+] 已附加到 {app.name} (pid {app.pid})")
-            return session, script
-    raise RuntimeError("找不到 Pikmin Bloom 程序，請確認遊戲已執行")
+
+    # 優先：直接用 package name attach（最快、最穩定）
+    try:
+        session = device.attach(PIKMIN_PKG)
+        script = session.create_script(FRIDA_SCRIPT.read_text())
+        script.load()
+        print(f"[+] 已附加到 {PIKMIN_PKG}")
+        return session, script
+    except frida.ProcessNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[!] package name attach 失敗: {e}，改用 enumerate_processes...")
+
+    # 備用：enumerate_processes（比 enumerate_applications 快，不需 scope="full"）
+    for proc in device.enumerate_processes():
+        name = proc.name.lower()
+        if "pikmin" in name or "nianticlabs" in name:
+            try:
+                session = device.attach(proc.pid)
+                script = session.create_script(FRIDA_SCRIPT.read_text())
+                script.load()
+                print(f"[+] 已附加到 {proc.name} (pid {proc.pid})")
+                return session, script
+            except Exception as e:
+                print(f"[!] 附加 pid {proc.pid} 失敗: {e}")
+
+    raise RuntimeError(
+        f"找不到 Pikmin Bloom 程序。\n"
+        f"請確認：\n"
+        f"  1. 遊戲正在執行中\n"
+        f"  2. frida-server 已在 emulator 上啟動\n"
+        f"  3. adb forward tcp:{FRIDA_HOST.split(':')[1]} tcp:{FRIDA_HOST.split(':')[1]} 已執行\n"
+        f"  手動確認：frida-ps -H {FRIDA_HOST} | grep -i pikmin"
+    )
 
 # ── 掃描 + 動態等載入 ─────────────────────────────────────────────────────────
 def scan_with_wait(script, lat: float, lon: float) -> list:
