@@ -770,8 +770,9 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                     const extras = [];
                     for (let off = 64; off <= 128; off += 8) {
                         const lo = dv.getInt32(i + off, true);
-                        const hi = dv.getUint32(i + off + 4, true);
+                        const hi = dv.getInt32(i + off + 4, true);
                         if (lo >= 1 && lo <= 10 && hi === 0) extras.push("[+" + off + "]=" + lo);
+                        else if (lo >= 1 && lo <= 10 && hi >= 1 && hi <= 10) extras.push("[+" + off + "]={" + lo + "," + hi + "}");
                     }
                     if (extras.length) instInfo += "  " + extras.join(" ");
                 }
