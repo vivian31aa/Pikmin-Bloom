@@ -198,12 +198,12 @@ def main():
                 sys.exit(1)
 
     output_path = Path(args.output)
-    # 載入已有結果（支援斷點續掃）
+    # 載入已有結果（支援斷點續掃）；用 4 位小數做 key（精度≈11m，容忍同菇座標微差）
     seen: dict = {}
     if output_path.exists():
         try:
             for m in json.loads(output_path.read_text()):
-                seen[f"{m['lat']:.6f},{m['lon']:.6f}"] = m
+                seen[f"{m['lat']:.4f},{m['lon']:.4f}"] = m
             print(f"[*] 載入已有 {len(seen)} 筆記錄")
         except Exception:
             pass
@@ -227,11 +227,17 @@ def main():
                     print(f"掃描錯誤: {e}")
                     continue
 
-                # 只保留 large (size=3)
-                large = [r for r in results if r.get("size") == 3]
+                # 只保留 large (size=3)，濾掉假陽性（crystal 只能是 1 或 4，colorId 要 > 0）
+                large = [
+                    r for r in results
+                    if r.get("size") == 3
+                    and r.get("crystal") in (1, 4)
+                    and r.get("colorId", 0) > 0
+                ]
                 new_count = 0
                 for m in large:
-                    key = f"{m['lat']:.6f},{m['lon']:.6f}"
+                    # 4 位小數 key ≈ 11m，同菇不同 copy 會被去重
+                    key = f"{m['lat']:.4f},{m['lon']:.4f}"
                     if key not in seen:
                         m["city"] = city_name
                         m["colorName"] = COLOR_LABEL.get(m.get("colorId", 0), str(m.get("colorId", "?")))
