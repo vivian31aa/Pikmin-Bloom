@@ -789,7 +789,11 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                             extras.push("[+" + off + "]=" + lo);
                         } else if (lo >= 1 && lo <= 20 && hi >= 1 && hi <= 20) {
                             extras.push("[+" + off + "]={" + lo + "," + hi + "}");
-                            if (off === 144) { objCrystal = lo; objSize = hi; }
+                            // {crystal,size}: crystal∈{1,4}, size∈{1,2,3} — last match wins
+                            // covers Type-A ([+96]) and Type-B ([+144])
+                            if ((lo === 1 || lo === 4) && hi >= 1 && hi <= 3) {
+                                objCrystal = lo; objSize = hi;
+                            }
                             if (off === 152) { objColorId = lo; }
                         }
                     }
