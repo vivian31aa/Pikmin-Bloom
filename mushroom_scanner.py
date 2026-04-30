@@ -137,13 +137,22 @@ def scan_with_wait(script, lat: float, lon: float) -> list:
     counts = []
     deadline = time.time() + (LOAD_WAIT_MAX - LOAD_WAIT_MIN)
     last_results = []
+    attempt = 0
 
     while time.time() < deadline:
+        attempt += 1
         try:
             raw = script.exports.scan_mushrooms(lat, lon, SCAN_RADIUS)
             results = json.loads(raw)
-        except Exception:
+            err = None
+        except Exception as e:
             results = []
+            err = e
+
+        sizes = [r.get("size") for r in results]
+        n_large = sizes.count(3)
+        print(f"\n    RPC#{attempt}: total={len(results)} large={n_large}"
+              + (f" err={err}" if err else ""), end="", flush=True)
 
         counts.append(len(results))
         last_results = results
@@ -152,10 +161,13 @@ def scan_with_wait(script, lat: float, lon: float) -> list:
         if len(counts) >= STABLE_CHECKS:
             recent = counts[-STABLE_CHECKS:]
             if len(set(recent)) == 1 and recent[0] > 0:
+                print(" [stable]", flush=True)
                 break
 
         time.sleep(STABLE_INTERVAL)
 
+    if not last_results:
+        print(" [timeout/empty]", flush=True)
     return last_results
 
 # ── 格點生成 ──────────────────────────────────────────────────────────────────
