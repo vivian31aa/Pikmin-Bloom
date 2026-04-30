@@ -227,12 +227,11 @@ def main():
                     print(f"掃描錯誤: {e}")
                     continue
 
-                # 只保留 large (size=3)，濾掉假陽性（crystal 只能是 1 或 4，colorId 要 > 0）
+                # 只保留 large (size=3)，濾掉假陽性（crystal 只能是 1 或 4）
                 large = [
                     r for r in results
                     if r.get("size") == 3
                     and r.get("crystal") in (1, 4)
-                    and r.get("colorId", 0) > 0
                 ]
                 new_count = 0
                 for m in large:
