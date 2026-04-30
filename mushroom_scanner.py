@@ -35,10 +35,11 @@ FRIDA_HOST     = "127.0.0.1:27042"
 FRIDA_SCRIPT   = Path(__file__).parent / "frida_hook.js"
 OUTPUT_FILE    = Path(__file__).parent / "large_mushrooms.json"
 
-LOAD_WAIT_MIN  = 4     # 移動後最少等待秒數
-LOAD_WAIT_MAX  = 15    # 等待上限
+LOAD_WAIT_MIN  = 8     # 移動後最少等待秒數
+LOAD_WAIT_MAX  = 25    # 等待上限
 STABLE_CHECKS  = 3     # 連續幾次掃描結果相同才算穩定
-STABLE_INTERVAL= 1.5   # 每次穩定檢查間隔秒
+STABLE_INTERVAL= 2.0   # 每次穩定檢查間隔秒
+STABLE_MIN_COUNT = 5   # 至少掃到這麼多才算 stable（避免還在載入就退出）
 
 SCAN_RADIUS    = 0.003  # 單次掃描半徑 (度，約 300m)
 DEFAULT_STEP   = 0.005  # 格點間距 (度，約 500m；確保覆蓋重疊)
@@ -157,10 +158,10 @@ def scan_with_wait(script, lat: float, lon: float) -> list:
         counts.append(len(results))
         last_results = results
 
-        # 穩定條件：最近 N 次計數相同且不為 0
+        # 穩定條件：最近 N 次計數相同 且 count >= STABLE_MIN_COUNT
         if len(counts) >= STABLE_CHECKS:
             recent = counts[-STABLE_CHECKS:]
-            if len(set(recent)) == 1 and recent[0] > 0:
+            if len(set(recent)) == 1 and recent[0] >= STABLE_MIN_COUNT:
                 print(" [stable]", flush=True)
                 break
 
