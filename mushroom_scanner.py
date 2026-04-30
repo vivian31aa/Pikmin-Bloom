@@ -180,6 +180,7 @@ def main():
     parser.add_argument("--range", type=float, default=DEFAULT_RANGE, help=f"掃描半徑(度) 預設{DEFAULT_RANGE}")
     parser.add_argument("--step",  type=float, default=DEFAULT_STEP,  help=f"格點間距(度) 預設{DEFAULT_STEP}")
     parser.add_argument("--wait",  type=float, default=LOAD_WAIT_MIN, help=f"最短等待秒數 預設{LOAD_WAIT_MIN}")
+    parser.add_argument("--debug", action="store_true", help="顯示每格掃描的原始 size/crystal 分布")
     parser.add_argument("--output", default=str(OUTPUT_FILE))
     args = parser.parse_args()
 
@@ -226,6 +227,16 @@ def main():
                 except Exception as e:
                     print(f"掃描錯誤: {e}")
                     continue
+
+                # debug: 顯示 size 分布
+                if args.debug and results:
+                    from collections import Counter
+                    size_dist = Counter(r.get("size") for r in results)
+                    crystal_dist = Counter(r.get("crystal") for r in results)
+                    print(f"\n    [debug] total={len(results)} size={dict(size_dist)} crystal={dict(crystal_dist)}")
+                    for r in results:
+                        if r.get("size") == 3:
+                            print(f"    [debug] large: {r}")
 
                 # 只保留 large (size=3)，濾掉假陽性（crystal 只能是 1 或 4）
                 large = [
