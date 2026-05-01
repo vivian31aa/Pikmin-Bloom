@@ -49,8 +49,8 @@ COLOR_LABEL = {
     0: "normal", 2: "red", 6: "yellow", 9: "pink/electric",
     11: "fire", 13: "crystal", 17: "normal", 18: "poisonous",
 }
-# 只收錄已確認的有色大菇（whitelist）；colorId=0,17 = normal brilliant，略過
-COLORED_IDS = {2, 6, 9, 11, 13, 18}
+# 已確認的 normal brilliant ID，掃描時排除；未知 colorId 保留（避免漏掉新類型）
+NORMAL_IDS = {0, 17}
 SIZE_LABEL = {1: "small", 2: "normal", 3: "large"}
 
 # 預設城市清單 (lat, lon, name)
@@ -229,6 +229,11 @@ def main():
 
     total_new = 0
     try:
+        if args.step > SCAN_RADIUS * 2:
+            gap = args.step - SCAN_RADIUS * 2
+            print(f"[!] 注意：step={args.step} > radius*2={SCAN_RADIUS*2:.3f}，"
+                  f"格點間有 {gap:.3f}°({gap*111000:.0f}m) 盲區，建議 --step {SCAN_RADIUS*2:.3f}")
+
         for city_lat, city_lon, city_name in targets:
             points = grid_points(city_lat, city_lon, args.range, args.step)
             print(f"\n[*] {city_name}  格點數={len(points)}")
@@ -250,15 +255,18 @@ def main():
                     crystal_dist = Counter(r.get("crystal") for r in results)
                     print(f"\n    [debug] total={len(results)} size={dict(size_dist)} crystal={dict(crystal_dist)}")
                     for r in results:
-                        if r.get("size") == 3:
-                            print(f"    [debug] large: {r}")
+                        if r.get("size") == 3 and r.get("crystal") in (1, 4):
+                            cid = r.get("colorId", 0)
+                            label = COLOR_LABEL.get(cid, f"未知colorId={cid}")
+                            tag = " [略過 normal]" if cid in NORMAL_IDS else ""
+                            print(f"    [debug] large: {label}{tag} @({r['lat']:.5f},{r['lon']:.5f})")
 
-                # 只保留已確認的有色大菇（whitelist）；排除 normal brilliant (colorId=0,17)
+                # 排除已知 normal brilliant；未知 colorId 保留（可能是新類型）
                 large = [
                     r for r in results
                     if r.get("size") == 3
                     and r.get("crystal") in (1, 4)
-                    and r.get("colorId", 0) in COLORED_IDS
+                    and r.get("colorId", 0) not in NORMAL_IDS
                 ]
                 new_count = 0
                 for m in large:
