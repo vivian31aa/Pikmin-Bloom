@@ -257,15 +257,22 @@ def main():
                     for r in results:
                         if r.get("size") == 3 and r.get("crystal") in (1, 4):
                             cid = r.get("colorId", 0)
+                            typ = r.get("type", "?")
                             label = COLOR_LABEL.get(cid, f"未知colorId={cid}")
-                            tag = " [略過 normal]" if cid in NORMAL_IDS else ""
-                            print(f"    [debug] large: {label}{tag} @({r['lat']:.5f},{r['lon']:.5f})")
+                            if typ != "B":
+                                tag = f" [略過 Type-{typ}]"
+                            elif cid in NORMAL_IDS:
+                                tag = " [略過 normal]"
+                            else:
+                                tag = ""
+                            print(f"    [debug] large: {label} Type-{typ}{tag} @({r['lat']:.5f},{r['lon']:.5f})")
 
-                # 排除已知 normal brilliant；未知 colorId 保留（可能是新類型）
+                # 只保留 Type-B（size/colorId 位置已確認）；Type-A 的 [+96]/[+152] 不可靠
                 large = [
                     r for r in results
                     if r.get("size") == 3
                     and r.get("crystal") in (1, 4)
+                    and r.get("type") == "B"
                     and r.get("colorId", 0) not in NORMAL_IDS
                 ]
                 new_count = 0
