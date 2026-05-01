@@ -47,7 +47,7 @@ DEFAULT_RANGE  = 0.05   # 城市掃描半徑 (度，約 5km)
 
 COLOR_LABEL = {
     0: "normal", 2: "red", 6: "yellow", 9: "pink/electric",
-    11: "fire", 13: "crystal", 17: "normal", 18: "poisonous",
+    11: "fire", 12: "water", 13: "crystal", 17: "normal", 18: "poisonous",
 }
 # 已確認的 normal brilliant ID，掃描時排除；未知 colorId 保留（避免漏掉新類型）
 NORMAL_IDS = {0, 17}
