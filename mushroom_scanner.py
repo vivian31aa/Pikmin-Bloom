@@ -47,8 +47,10 @@ DEFAULT_RANGE  = 0.05   # 城市掃描半徑 (度，約 5km)
 
 COLOR_LABEL = {
     0: "normal", 2: "red", 6: "yellow", 9: "pink/electric",
-    11: "fire", 13: "crystal", 18: "poisonous",
+    11: "fire", 13: "crystal", 17: "normal", 18: "poisonous",
 }
+# 只收錄已確認的有色大菇（whitelist）；colorId=0,17 = normal brilliant，略過
+COLORED_IDS = {2, 6, 9, 11, 13, 18}
 SIZE_LABEL = {1: "small", 2: "normal", 3: "large"}
 
 # 預設城市清單 (lat, lon, name)
@@ -251,12 +253,12 @@ def main():
                         if r.get("size") == 3:
                             print(f"    [debug] large: {r}")
 
-                # 只保留 large (size=3)，有顏色的菇（colorId>0）；colorId=0 = normal brilliant 不收
+                # 只保留已確認的有色大菇（whitelist）；排除 normal brilliant (colorId=0,17)
                 large = [
                     r for r in results
                     if r.get("size") == 3
                     and r.get("crystal") in (1, 4)
-                    and r.get("colorId", 0) > 0
+                    and r.get("colorId", 0) in COLORED_IDS
                 ]
                 new_count = 0
                 for m in large:
