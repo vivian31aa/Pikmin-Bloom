@@ -47,7 +47,7 @@ DEFAULT_RANGE  = 0.05   # 城市掃描半徑 (度，約 5km)
 
 COLOR_LABEL = {
     2: "red", 6: "yellow", 9: "pink/electric",
-    11: "fire", 18: "poisonous",
+    11: "fire", 13: "crystal", 18: "poisonous",
 }
 SIZE_LABEL = {1: "small", 2: "normal", 3: "large"}
 

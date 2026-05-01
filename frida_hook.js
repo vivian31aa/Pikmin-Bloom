@@ -965,7 +965,7 @@ global.dump_at = function(addrStr, before, after) {
 // size: "small"|"normal"|"large"   color: "red"|"yellow"|"pink"|"fire"|"poisonous"|...
 global.find_mushrooms = function(sizeStr, colorStr) {
     const SIZE_MAP   = {small:1, normal:2, large:3};
-    const COLOR_MAP  = {red:2, yellow:6, pink:9, electric:9, fire:11, poisonous:18, white:18};
+    const COLOR_MAP  = {red:2, yellow:6, pink:9, electric:9, fire:11, crystal:13, poisonous:18, white:18};
     const targetSize  = sizeStr  ? (SIZE_MAP[sizeStr.toLowerCase()]  || 0) : 0;
     const targetColor = colorStr ? (COLOR_MAP[colorStr.toLowerCase()] || 0) : 0;
 
