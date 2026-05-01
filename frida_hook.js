@@ -782,6 +782,8 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                 // Scan [+64..+160] for small int32s (size/crystal field candidates)
                 if (i + 168 <= n) {
                     const extras = [];
+                    // Type-B size confirmed at [+144]; Type-A at [+96] — use fixed offset per type
+                    const sizeOff = typeStr === "B" ? 144 : 96;
                     for (let off = 64; off <= 160; off += 8) {
                         const lo = dv.getInt32(i + off, true);
                         const hi = dv.getInt32(i + off + 4, true);
@@ -789,9 +791,8 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
                             extras.push("[+" + off + "]=" + lo);
                         } else if (lo >= 1 && lo <= 20 && hi >= 1 && hi <= 20) {
                             extras.push("[+" + off + "]={" + lo + "," + hi + "}");
-                            // {crystal,size}: crystal∈{1,4}, size∈{1,2,3} — last match wins
-                            // covers Type-A ([+96]) and Type-B ([+144])
-                            if ((lo === 1 || lo === 4) && hi >= 1 && hi <= 3) {
+                            // Read size only from the confirmed offset to avoid false overrides
+                            if (off === sizeOff && (lo === 1 || lo === 4) && hi >= 1 && hi <= 3) {
                                 objCrystal = lo; objSize = hi;
                             }
                             if (off === 152) { objColorId = lo; }
