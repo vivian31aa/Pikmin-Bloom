@@ -681,7 +681,7 @@ global.scan_mushroom_objects = function(cap, latCenter, latRadius, lonCenter, lo
     const seenInst = new Set();   // de-dup by [+56] ptr value
 
     // dynamic lat/lon pre-filter bounds (supports non-Taiwan coordinates)
-    const margin = 0.05;
+    const margin = 0.10;  // ≥ max expected latRadius/lonRadius
     const latMin = filterCoord ? latCenter - Math.max(latRadius, margin) : -90.0;
     const latMax = filterCoord ? latCenter + Math.max(latRadius, margin) :  90.0;
     const lonMin = filterCoord ? lonCenter - Math.max(lonRadius, margin) : -180.0;
