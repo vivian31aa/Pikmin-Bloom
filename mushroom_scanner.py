@@ -251,11 +251,12 @@ def main():
                         if r.get("size") == 3:
                             print(f"    [debug] large: {r}")
 
-                # 只保留 large (size=3)，濾掉假陽性（crystal 只能是 1 或 4）
+                # 只保留 large (size=3)，有顏色的菇（colorId>0）；colorId=0 = normal brilliant 不收
                 large = [
                     r for r in results
                     if r.get("size") == 3
                     and r.get("crystal") in (1, 4)
+                    and r.get("colorId", 0) > 0
                 ]
                 new_count = 0
                 for m in large:
