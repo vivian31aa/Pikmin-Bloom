@@ -35,15 +35,15 @@ FRIDA_HOST     = "127.0.0.1:27042"
 FRIDA_SCRIPT   = Path(__file__).parent / "frida_hook.js"
 OUTPUT_FILE    = Path(__file__).parent / "large_mushrooms.json"
 
-LOAD_WAIT_MIN  = 8     # 移動後最少等待秒數
-LOAD_WAIT_MAX  = 25    # 等待上限
+LOAD_WAIT_MIN  = 5     # 移動後最少等待秒數
+LOAD_WAIT_MAX  = 20    # 等待上限
 STABLE_CHECKS  = 3     # 連續幾次掃描結果相同才算穩定
-STABLE_INTERVAL= 2.0   # 每次穩定檢查間隔秒
+STABLE_INTERVAL= 1.5   # 每次穩定檢查間隔秒
 STABLE_MIN_COUNT = 5   # 至少掃到這麼多才算 stable（避免還在載入就退出）
 
-SCAN_RADIUS    = 0.05   # 單次掃描半徑 (度，約 5km)：遊戲已載入附近所有菇，直接全撈
-DEFAULT_STEP   = 0.09   # 格點間距 (度) ≤ radius*2=0.10，確保無盲區
-DEFAULT_RANGE  = 0.5    # 城市掃描半徑 (度，約 55km)
+SCAN_RADIUS    = 0.003  # 單次掃描半徑 (度，約 330m)；遊戲載入半徑約 300-500m
+DEFAULT_STEP   = 0.006  # 格點間距 = radius*2，確保無盲區
+DEFAULT_RANGE  = 0.05   # 城市掃描半徑 (度，約 5km)
 
 COLOR_LABEL = {
     0: "normal", 2: "red", 6: "yellow", 9: "pink/electric",
