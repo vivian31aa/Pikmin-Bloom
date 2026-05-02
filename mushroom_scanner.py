@@ -187,19 +187,21 @@ def grid_points(center_lat, center_lon, range_deg, step_deg):
 
 # ── 主程式 ────────────────────────────────────────────────────────────────────
 def main():
-    global LOAD_WAIT_MIN
+    global LOAD_WAIT_MIN, SCAN_RADIUS
     parser = argparse.ArgumentParser(description="Pikmin Bloom large mushroom Frida scanner")
     parser.add_argument("--cities", nargs="*", help="城市名稱篩選（空格分隔，預設掃全部）")
     parser.add_argument("--lat",   type=float, help="自訂中心緯度（與 --lon 搭配）")
     parser.add_argument("--lon",   type=float, help="自訂中心經度")
     parser.add_argument("--range", type=float, default=DEFAULT_RANGE, help=f"掃描半徑(度) 預設{DEFAULT_RANGE}")
     parser.add_argument("--step",  type=float, default=DEFAULT_STEP,  help=f"格點間距(度) 預設{DEFAULT_STEP}")
+    parser.add_argument("--radius",type=float, default=SCAN_RADIUS,   help=f"RPC 過濾半徑(度) 預設{SCAN_RADIUS}")
     parser.add_argument("--wait",  type=float, default=LOAD_WAIT_MIN, help=f"最短等待秒數 預設{LOAD_WAIT_MIN}")
     parser.add_argument("--debug", action="store_true", help="顯示每格掃描的原始 size/crystal 分布")
     parser.add_argument("--output", default=str(OUTPUT_FILE))
     args = parser.parse_args()
 
     LOAD_WAIT_MIN = args.wait
+    SCAN_RADIUS   = args.radius
 
     # 決定掃描目標列表
     if args.lat is not None and args.lon is not None:
