@@ -978,7 +978,7 @@ global.find_mushrooms = function(sizeStr, colorStr) {
         return true;
     });
     const SIZE_LABEL  = {1:"small", 2:"normal", 3:"large"};
-    const COLOR_LABEL = {0:"normal", 2:"red", 6:"yellow", 8:"purple", 9:"pink/electric", 11:"fire", 12:"water", 13:"crystal", 18:"poisonous"};
+    const COLOR_LABEL = {0:"normal", 2:"red", 6:"yellow", 7:"white", 8:"purple", 9:"pink/electric", 11:"fire", 12:"water", 13:"crystal", 18:"poisonous"};
     filtered.forEach(function(m) {
         console.log("MUSHROOM  lat=" + m.lat.toFixed(6) + "  lon=" + m.lon.toFixed(6) +
                     "  size=" + (SIZE_LABEL[m.size] || m.size) +
